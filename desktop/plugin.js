@@ -8,7 +8,11 @@
  *   a level). Chats: drag between folders, or ⋯ / right-click → Move to.
  * - Collapsed folders show unread and agent-working activity from inside.
  * - Filter box, "Open all as tabs", layout export/import via the clipboard.
- * - Layout is local to this app, one copy per connection (ctx.storage).
+ * - Layout is stored on the connected backend ($HERMES_HOME/pinned-folders/
+ *   layout.json, served by dashboard/plugin_api.py) and cached per connection
+ *   in ctx.storage, so every app on that backend sees the same folders and an
+ *   agent on the server can file chats. Collapse state and view stay local.
+ *   Without the backend half the plugin falls back to local-only storage.
  *
  * Two builds come from this one file. Blocks between `// #full` and `// #end`
  * reach past the plugin SDK (the full build's direct unpin, auto-pin chats
@@ -56,6 +60,7 @@ const POLL_MS = 4000
 
 let store = null // ctx.storage, set in register()
 let os = null // ctx.os (clipboard), set in register()
+let rest = null // ctx.rest (this plugin's backend namespace), set in register()
 
 // ── pure tree ops (exported for tests) ───────────────────────────────────────
 
@@ -511,6 +516,98 @@ export function mutateTree(key, fn) {
   if (next === prev) return
   store.set(key, next)
   emit({ type: 'tree', key, tree: next })
+  schedulePush(key)
+}
+
+// ── server sync: the layout lives on the backend ─────────────────────────────
+// Shared fields go to the server; collapse state and the view menu are
+// per-app and never leave this machine.
+const SYNC_MS = 4000
+const PUSH_DELAY_MS = 400
+
+export function sharedPart(t) {
+  return { folders: t.folders, placed: t.placed, order: t.order, foldersOrdered: true }
+}
+
+// Server layout + this app's local-only fields -> the tree to show.
+export function adoptServer(local, server) {
+  const n = normalize({ ...server, foldersOrdered: true })
+  return { ...n, collapsed: local.collapsed, view: local.view }
+}
+
+const sync = { key: null, rev: null, timer: 0, pushing: false, dirty: false, available: null }
+
+function schedulePush(key) {
+  if (!rest || key !== sync.key || sync.available === false) return
+  sync.dirty = true
+  clearTimeout(sync.timer)
+  sync.timer = setTimeout(() => pushNow(key), PUSH_DELAY_MS)
+}
+
+async function pushNow(key) {
+  if (key !== sync.key || sync.pushing) return
+  sync.pushing = true
+  sync.dirty = false
+  try {
+    const res = await rest('/layout', { method: 'PUT', body: { layout: sharedPart(loadTree(key)), base: sync.rev } })
+    if (key === sync.key && res && res.rev) sync.rev = res.rev
+  } catch {
+    // Conflict (someone else wrote) or transient failure: the server wins.
+    await pullNow(key, true)
+  } finally {
+    sync.pushing = false
+    if (sync.dirty && key === sync.key) schedulePush(key)
+  }
+}
+
+async function pullNow(key, force = false) {
+  if (!rest || key !== sync.key) return
+  let res
+  try {
+    res = await rest('/layout')
+    sync.available = true
+  } catch (err) {
+    // No backend half on this connection: stay local-only, quietly.
+    if (sync.available === null) sync.available = false
+    return
+  }
+  if (key !== sync.key || (!force && (sync.pushing || sync.dirty))) return
+  if (!res || !res.layout) {
+    // Empty server: seed it with what this app already has.
+    const local = loadTree(key)
+    if (local.folders.length || Object.keys(local.placed).length) {
+      sync.rev = null
+      schedulePush(key)
+    }
+    return
+  }
+  if (res.rev === sync.rev && !force) return
+  sync.rev = res.rev
+  const next = adoptServer(loadTree(key), res.layout)
+  store.set(key, next)
+  emit({ type: 'tree', key, tree: next })
+}
+
+function useServerSync(key) {
+  useEffect(() => {
+    if (!rest) return
+    sync.key = key
+    sync.rev = null
+    sync.dirty = false
+    sync.available = null
+    let alive = true
+    let timer = 0
+    const tick = async () => {
+      await pullNow(key)
+      if (alive && sync.available !== false) timer = setTimeout(tick, SYNC_MS)
+    }
+    tick()
+    return () => {
+      alive = false
+      clearTimeout(timer)
+      if (sync.key === key) sync.key = null
+    }
+  }, [key])
 }
 
 function usePinnedRows(scope) {
@@ -770,6 +867,7 @@ function PinnedPane() {
     return onBus(ev => ev.type === 'tree' && ev.key === key && setTreeRaw(ev.tree))
   }, [key])
   const setTree = fn => mutateTree(key, fn)
+  useServerSync(key)
 
   const { rows, error, dropRow, patchRow, refresh: refreshRows } = usePinnedRows(key)
   const [deleting, setDeleting] = useState(null) // chat row awaiting the delete confirm
@@ -1291,6 +1389,7 @@ export default {
   register(ctx) {
     store = ctx.storage
     os = ctx.os
+    rest = typeof ctx.rest === 'function' ? ctx.rest : null
     ctx.register({
       id: 'pane',
       area: 'panes',

@@ -1,0 +1,11 @@
+{
+  "name": "pinned-folders",
+  "label": "Pinned folders",
+  "description": "Server-side store for the Pinned folders layout (shared by every Desktop app connected to this backend).",
+  "icon": "Folder",
+  "version": "0.2.0",
+  "tab": { "path": "/pinned-folders", "hidden": true },
+  "slots": [],
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
