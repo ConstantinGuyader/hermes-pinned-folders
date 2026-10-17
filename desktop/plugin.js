@@ -55,7 +55,13 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
-const ROOT = null // "Unsorted": a chat with no folder
+const ROOT = null // "À classer": a chat with no folder
+const RECENT_DAYS = 30
+const recencyMs = r => {
+  const v = r?.last_activity_at ?? r?.last_active ?? r?.updated_at ?? r?.started_at ?? 0
+  const n = typeof v === 'number' ? v : Date.parse(v) / 1000 || 0
+  return n > 1e12 ? n : n * 1000
+}
 const POLL_MS = 4000
 
 let store = null // ctx.storage, set in register()
@@ -626,7 +632,7 @@ function usePinnedRows(scope) {
         const res = await host.listPersistedSessions(null, { profile: 'all', limit: 0 })
         const seen = new Set()
         const rows = (res?.sessions || []).filter(s => {
-          if (!s.pinned || seen.has(s.id)) return false
+          if (s.archived || seen.has(s.id)) return false
           seen.add(s.id)
           return true
         })
@@ -856,6 +862,29 @@ function NameInput({ initial, onDone }) {
   })
 }
 
+const NAV = [
+  { icon: 'edit', label: 'Nouvelle session', run: () => host.newChat?.() },
+  { icon: 'extensions', label: 'Capacités', run: () => host.navigate('/capabilities') },
+  { icon: 'comment-discussion', label: 'Messagerie', run: () => host.navigate('/messaging') },
+  { icon: 'files', label: 'Artefacts', run: () => host.navigate('/artifacts') },
+  { icon: 'watch', label: 'Tâches planifiées', run: () => host.navigate('/cron') }
+]
+
+function NavList() {
+  return jsx('div', {
+    style: { padding: '6px 6px 4px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 1 },
+    children: NAV.map(n =>
+      jsxs('div', {
+        role: 'button',
+        className: 'hover:bg-(--ui-control-hover-background) text-(--ui-text-secondary)',
+        style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px', borderRadius: 6, cursor: 'pointer', fontSize: '0.8125rem' },
+        onClick: () => { try { n.run() } catch (e) { console.error('[pinned-folders] nav', e) } },
+        children: [jsx(Codicon, { name: n.icon, size: '0.875rem' }, 'i'), jsx('span', { children: n.label }, 't')]
+      }, n.label)
+    )
+  }, 'nav')
+}
+
 function PinnedPane() {
   const connectionId = useValue(host.state.connectionId)
   const focused = useValue(host.state.focusedStoredSessionId)
@@ -876,6 +905,7 @@ function PinnedPane() {
   const [dropAt, setDropAt] = useState(null)
   const [query, setQuery] = useState('')
   const [importing, setImporting] = useState(false)
+  const [showOld, setShowOld] = useState(false)
   const drag = useRef(null)
 
   const currentProfile = useValue(host.state.profile)
@@ -1254,7 +1284,10 @@ function PinnedPane() {
     ]
   }
 
-  const unsorted = sessionsIn.get(ROOT) || []
+  const unsortedAll = sessionsIn.get(ROOT) || []
+  const recentCut = Date.now() - RECENT_DAYS * 86400000
+  const unsorted = view || showOld ? unsortedAll : unsortedAll.filter(r => recencyMs(r) >= recentCut)
+  const olderCount = unsortedAll.length - unsorted.length
   const unsortedShown = visibleRows(unsorted, view)
   const unsortedOpen = view ? true : !tree.collapsed.__unsorted
   const unsortedRows = view && !unsortedShown.length ? [] : [
@@ -1268,13 +1301,21 @@ function PinnedPane() {
         children: [
           jsx(DisclosureCaret, { open: unsortedOpen, className: 'text-(--ui-text-tertiary)' }, 'caret'),
           jsx(Codicon, { name: 'inbox', size: '0.875rem', className: 'text-(--ui-text-tertiary)' }, 'icon'),
-          jsx('span', { style: { flex: 1, fontWeight: 500 }, className: 'text-(--ui-text-secondary)', children: 'Unsorted' }, 'name'),
+          jsx('span', { style: { flex: 1, fontWeight: 500 }, className: 'text-(--ui-text-secondary)', children: 'À classer' }, 'name'),
           jsx('span', { className: 'text-(--ui-text-quaternary)', style: { fontSize: '0.6875rem', paddingRight: 24 }, children: unsorted.length || '' }, 'n')
         ]
       },
       'unsorted'
     ),
-    ...(unsortedOpen ? unsortedShown.map(r => sessionRow(r, 1)) : [])
+    ...(unsortedOpen ? unsortedShown.map(r => sessionRow(r, 1)) : []),
+    ...(unsortedOpen && !view && (olderCount > 0 || showOld)
+      ? [jsx('div', {
+          className: 'hover:bg-(--ui-control-hover-background) text-(--ui-text-tertiary)',
+          style: rowStyle(1, { fontSize: '0.75rem', cursor: 'pointer' }),
+          onClick: () => setShowOld(v => !v),
+          children: showOld ? 'Voir seulement les ' + RECENT_DAYS + ' derniers jours' : 'Voir plus (' + olderCount + ' plus anciennes)'
+        }, 'older')]
+      : [])
   ]
 
   const note = text =>
@@ -1287,7 +1328,7 @@ function PinnedPane() {
     body = [note('Could not load pinned chats: ' + error)]
   } else {
     body = [...(childFolders.get(ROOT) || []).flatMap(f => folderRow(f, 0)), ...unsortedRows]
-    if (rows.length === 0) body.push(note('No pinned chats yet. Pin one in Sessions (⋯ → Pin); it lands in Unsorted.'))
+    if (rows.length === 0) body.push(note('Aucune conversation pour l’instant.'))
     else if (view && !body.length) body.push(note(query.trim() ? 'Nothing matches “' + query.trim() + '”.' : 'No pinned chats match this view.'))
   }
 
@@ -1315,6 +1356,7 @@ function PinnedPane() {
     'data-pinned-folders': '',
     style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
     children: [
+      jsx(NavList, {}, 'nav'),
       jsxs(
         'div',
         {
@@ -1324,7 +1366,7 @@ function PinnedPane() {
               'span',
               {
                 style: { flex: 1, fontSize: '0.64rem', fontWeight: 600, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--theme-primary)' },
-                children: 'Pinned folders'
+                children: 'Dossiers'
               },
               'label'
             ),
@@ -1393,13 +1435,13 @@ export default {
     ctx.register({
       id: 'pane',
       area: 'panes',
-      title: 'Pinned',
+      title: 'Dossiers',
       data: {
         placement: 'left',
         width: '260px',
         collapsible: true,
         hideOnly: true,
-        tabTitleText: () => 'Pinned',
+        tabTitleText: () => 'Dossiers',
         dock: { pane: 'sessions', pos: 'center', enforce: true }
       },
       render: () => jsx(PinnedPane, {})
