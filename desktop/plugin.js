@@ -629,7 +629,7 @@ function usePinnedRows(scope) {
       clearTimeout(timer)
       let fresh = null
       try {
-        const res = await host.listPersistedSessions(null, { profile: 'all', limit: 0 })
+        const res = await host.listPersistedSessions(null, { profile: 'all', limit: 500 })
         const seen = new Set()
         const rows = (res?.sessions || []).filter(s => {
           if (s.archived || seen.has(s.id)) return false
