@@ -108,3 +108,29 @@ def put_layout(payload: dict = Body(...)):
             return JSONResponse({"rev": rev, "layout": current}, status_code=409)
         new_rev = _write(layout)
     return {"rev": new_rev, "layout": layout}
+
+
+@router.post("/title")
+def set_title(payload: dict = Body(...)):
+    """Rename a chat (user-provenance title) in the owning profile's state.db."""
+    sid = str((payload or {}).get("session_id") or "").strip()
+    title = str((payload or {}).get("title") or "").strip()
+    profile = str((payload or {}).get("profile") or "default").strip() or "default"
+    if not sid or not title or len(title) > 200:
+        return JSONResponse({"error": "session_id and title (1-200 chars) required"}, status_code=400)
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state import SessionDB
+
+        db = SessionDB(Path(get_profile_dir(profile)) / "state.db")
+        try:
+            ok = db.set_session_title(sid, title)
+            if not ok and not db.get_session(sid):
+                return JSONResponse({"error": "unknown session"}, status_code=404)
+        finally:
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    return {"ok": True, "title": title}

@@ -392,6 +392,7 @@ export function chatMenuItems(row, { fid, flat, canUnpin, act }) {
     { label: 'Open in new tab', icon: 'split-horizontal', onSelect: () => act.open('tab') },
     { label: 'Open in new window', icon: 'link-external', onSelect: () => act.open('window') },
     '-',
+    { label: 'Rename', icon: 'edit', onSelect: act.rename },
     { label: 'Copy session ID', icon: 'copy', onSelect: act.copyId },
     '-',
     { header: 'Move to' },
@@ -980,6 +981,22 @@ function PinnedPane() {
     host.notify({ kind: 'success', message: 'Chat deleted', durationMs: 2000 })
   }
 
+  // Rename goes through this plugin's backend (dashboard/plugin_api.py, POST
+  // /title), so it works in the catalog build too (no window bridge needed).
+  const renameRow = (row, title) => {
+    const next = String(title || '').trim()
+    if (!next || next === row.title) return
+    patchRow(row.id, { title: next })
+    if (!rest) {
+      host.notifyError(new Error('No backend connection'), 'Could not rename that chat')
+      return
+    }
+    rest('/title', { method: 'POST', body: { session_id: row.id, title: next, ...(row.profile ? { profile: row.profile } : {}) } }).catch(err => {
+      host.notifyError(err, 'Could not rename that chat')
+      refreshRows()
+    })
+  }
+
   // Sequential on purpose: each open settles before the next tab is made.
   // Only the chats the folder shows (same selector as the render).
   const openAllAsTabs = async fid => {
@@ -1127,6 +1144,7 @@ function PinnedPane() {
         place: folder => setTree(t => ops.placeSession(t, row.id, folder)),
         unpin,
         del: () => setDeleting(row),
+        rename: () => setEditing('s:' + row.id),
       }
     })
     const active = focused && focused === row.id
@@ -1156,6 +1174,7 @@ function PinnedPane() {
                   initial: row.title || '',
                   onDone: value => {
                     setEditing(null)
+                    if (value != null) renameRow(row, value)
                   }
                 },
                 'edit'
