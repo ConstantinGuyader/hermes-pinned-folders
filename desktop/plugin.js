@@ -111,6 +111,27 @@ export function isDescendant(t, id, ancestor) {
   return false
 }
 
+const withoutGeneral = f => {
+  const g = { ...f }
+  delete g.generalSession
+  return g
+}
+
+// Drop `sid` as general chat of every folder except `keep`.
+function clearGeneralElsewhere(t, sid, keep) {
+  if (!t.folders.some(f => f.generalSession === sid && f.id !== keep)) return t
+  return { ...t, folders: t.folders.map(f => (f.generalSession === sid && f.id !== keep ? withoutGeneral(f) : f)) }
+}
+
+// Chat ids that are some folder's general chat (hidden from folder lists).
+export function generalIds(t) {
+  return new Set(t.folders.map(f => f.generalSession).filter(x => typeof x === 'string' && x))
+}
+
+// Which folders may carry a general chat. Root folders (companies) only for
+// now; the rest of the code is generic, so widening this is the only change.
+export const canHaveGeneral = f => !!f && !f.parent
+
 export const ops = {
   addFolder(t, parent, name, id = newId()) {
     const collapsed = { ...t.collapsed }
@@ -167,6 +188,8 @@ export const ops = {
     return { ...t, folders: rest }
   },
   placeSession(t, sid, folder, beforeSid) {
+    // A general chat moved out of its folder stops being that folder's general.
+    t = clearGeneralElsewhere(t, sid, folder)
     const placed = { ...t.placed }
     if (folder) placed[sid] = folder
     else delete placed[sid]
@@ -177,6 +200,7 @@ export const ops = {
     return { ...t, placed, order }
   },
   forgetSession(t, sid) {
+    t = clearGeneralElsewhere(t, sid, undefined)
     if (!(sid in t.placed) && !t.order.includes(sid)) return t
     const placed = { ...t.placed }
     delete placed[sid]
@@ -199,6 +223,27 @@ export const ops = {
         return next
       })
     }
+  },
+  // A folder's general chat: clicking the folder name opens it, and it leaves
+  // the folder's chat list. Setting one also files the chat in that folder.
+  // `sid` null/'' removes it (the chat stays filed in the folder).
+  setGeneral(t, fid, sid) {
+    if (!t.folders.some(f => f.id === fid)) return t
+    const next = sid ? String(sid) : null
+    let out = next ? ops.placeSession(t, next, fid) : t
+    out = {
+      ...out,
+      folders: out.folders.map(f => {
+        if (f.id === fid) {
+          const g = { ...f }
+          if (next) g.generalSession = next
+          else delete g.generalSession
+          return g
+        }
+        return next && f.generalSession === next ? withoutGeneral(f) : f
+      })
+    }
+    return out
   },
   setView(t, patch) {
     return { ...t, view: normalizeView({ ...normalizeView(t.view), ...patch }) }
@@ -439,7 +484,7 @@ export function importLayout(text) {
   if (!Array.isArray(v.folders)) throw new Error('The layout has no folder list.')
   const folders = v.folders
     .filter(f => f && typeof f.id === 'string' && typeof f.name === 'string')
-    .map(f => ({ id: f.id, name: f.name, parent: typeof f.parent === 'string' ? f.parent : null, ...(typeof f.color === 'string' ? { color: f.color } : {}) }))
+    .map(f => ({ id: f.id, name: f.name, parent: typeof f.parent === 'string' ? f.parent : null, ...(typeof f.color === 'string' ? { color: f.color } : {}), ...(typeof f.generalSession === 'string' && f.generalSession ? { generalSession: f.generalSession } : {}) }))
   const ids = new Set(folders.map(f => f.id))
   for (const f of folders) if (f.parent && !ids.has(f.parent)) f.parent = null
   // Break any cycle a hand-edited file might carry.
@@ -927,16 +972,32 @@ function PinnedPane() {
     return m
   }, [tree.folders, folderIds])
 
-  const sessionsIn = useMemo(() => {
+  const generals = useMemo(() => generalIds(tree), [tree])
+  const rowById = useMemo(() => new Map((rows || []).map(r => [r.id, r])), [rows])
+
+  // Every chat filed directly in each folder, general chats included: the
+  // "Conversation générale" menu picks from these.
+  const filedIn = useMemo(() => {
     const m = new Map()
     for (const row of rows || []) {
       const fid = folderOf(tree, folderIds, row.id)
       if (!m.has(fid)) m.set(fid, [])
       m.get(fid).push(row)
     }
+    return m
+  }, [rows, tree, folderIds])
+
+  const sessionsIn = useMemo(() => {
+    const m = new Map()
+    for (const row of rows || []) {
+      if (generals.has(row.id) && tree.folders.some(f => f.generalSession === row.id && folderOf(tree, folderIds, row.id) === f.id)) continue
+      const fid = folderOf(tree, folderIds, row.id)
+      if (!m.has(fid)) m.set(fid, [])
+      m.get(fid).push(row)
+    }
     for (const [fid, list] of m) m.set(fid, orderRows(list, tree.order, viewOpts.order))
     return m
-  }, [rows, tree, folderIds, viewOpts.order])
+  }, [rows, tree, folderIds, viewOpts.order, generals])
 
   const countIn = id => chatsBeneath(id, sessionsIn, childFolders, view).length
 
@@ -1200,6 +1261,34 @@ function PinnedPane() {
     const open = view ? true : !tree.collapsed[f.id]
     const moveTargets = flat.filter(({ f: o }) => o.id !== f.id && !isDescendant(tree, o.id, f.id))
     const total = countIn(f.id)
+    const general = f.generalSession || null
+    const generalRow = general ? rowById.get(general) : null
+    const openGeneral = intent =>
+      host
+        .openSession(general, { profile: generalRow?.profile || undefined, ...(intent ? { intent } : {}) })
+        .catch(err => host.notifyError(err, 'Impossible d’ouvrir la conversation générale'))
+    // Candidates: chats filed directly in this folder, then those beneath it.
+    const candidates = canHaveGeneral(f)
+      ? [...(filedIn.get(f.id) || []), ...(childFolders.get(f.id) || []).flatMap(c => chatsBeneath(c.id, sessionsIn, childFolders, null))]
+          .sort((a, b) => recencyMs(b) - recencyMs(a))
+          .slice(0, 15)
+      : []
+    const generalItems = canHaveGeneral(f)
+      ? [
+          '-',
+          { header: 'Conversation générale' },
+          ...(general ? [{ label: 'Ouvrir la conversation générale', icon: 'comment-discussion', onSelect: () => openGeneral() }] : []),
+          ...candidates.map(r => ({
+            label: (r.id === general ? '' : 'Définir : ') + (r.title || r.preview || 'Sans titre'),
+            icon: r.id === general ? 'check' : 'blank',
+            indent: 1,
+            disabled: r.id === general,
+            onSelect: () => setTree(t => ops.setGeneral(t, f.id, r.id))
+          })),
+          ...(!candidates.length && !general ? [{ label: 'Aucune conversation dans ce dossier', icon: 'blank', disabled: true, onSelect: () => {} }] : []),
+          ...(general ? [{ label: 'Retirer la conversation générale', icon: 'close', onSelect: () => setTree(t => ops.setGeneral(t, f.id, null)) }] : [])
+        ]
+      : []
     const items = [
       { label: 'Open all as tabs' + (total ? ` (${total})` : ''), icon: 'multiple-windows', disabled: !total, onSelect: () => openAllAsTabs(f.id) },
       '-',
@@ -1218,6 +1307,8 @@ function PinnedPane() {
         disabled: o.id === f.parent,
         onSelect: () => setTree(t => ops.moveFolder(t, f.id, o.id))
       })),
+      '-',
+      ...generalItems,
       '-',
       { label: 'Delete folder (keeps its chats)', icon: 'trash', destructive: true, onSelect: () => setTree(t => ops.deleteFolder(t, f.id)) }
     ]
@@ -1250,7 +1341,10 @@ function PinnedPane() {
         ...dragProps('folder', f.id),
         ...folderDrop(f.id),
         className: 'hover:bg-(--ui-control-hover-background)',
-        style: rowStyle(depth, folderDropStyle(f.id)),
+        style: rowStyle(depth, {
+          ...(general && focused === general ? { background: 'var(--ui-row-active-background)' } : null),
+          ...folderDropStyle(f.id)
+        }),
         onClick: () => editing !== f.id && !view && setTree(t => ops.toggle(t, f.id)),
         onDoubleClick: e => {
           e.stopPropagation()
@@ -1283,11 +1377,43 @@ function PinnedPane() {
             : jsx(
                 'span',
                 {
-                  style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 500 },
+                  style: {
+                    flex: 1,
+                    minWidth: 0,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    fontWeight: 500,
+                    ...(general ? { cursor: 'pointer' } : null)
+                  },
+                  // With a general chat, the name opens it (⌘/Ctrl: new tab);
+                  // the rest of the row (caret, icon) still folds the folder.
+                  ...(general
+                    ? {
+                        title: 'Ouvrir ' + (generalRow?.title || 'la conversation générale'),
+                        onClick: e => {
+                          if (editing === f.id) return
+                          e.stopPropagation()
+                          openGeneral(e.metaKey || e.ctrlKey ? 'tab' : undefined)
+                        }
+                      }
+                    : null),
                   children: f.name
                 },
                 'name'
               ),
+          general
+            ? jsx(
+                'span',
+                {
+                  title: 'Conversation générale' + (generalRow?.title ? ' : ' + generalRow.title : '') + (generalRow?.unread ? ' (non lue)' : ''),
+                  className: generalRow?.unread ? 'text-(--ui-success)' : 'text-(--ui-text-quaternary)',
+                  style: { display: 'grid', placeItems: 'center', flexShrink: 0 },
+                  children: jsx(Codicon, { name: 'comment-discussion', size: '0.75rem' })
+                },
+                'general'
+              )
+            : null,
           badge,
           jsx('span', { className: 'text-(--ui-text-quaternary)', style: { fontSize: '0.6875rem' }, children: total || '' }, 'n'),
           jsx(RowMenu, { items }, 'menu')

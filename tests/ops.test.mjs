@@ -25,7 +25,7 @@ export async function load(u, c, n) {
   return n(u, c)
 }`))
 const mod = await import(target.href)
-const { ops, normalize, folderActivity, filterView, ancestorsOf, isDescendant, folderOf, exportLayout, importLayout, default: plugin } = mod
+const { ops, normalize, folderActivity, filterView, ancestorsOf, isDescendant, folderOf, exportLayout, importLayout, generalIds, canHaveGeneral, default: plugin } = mod
 const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1) } else console.log('ok', m) }
 console.log('# build:', FULL ? 'full' : 'catalog')
 let t = { folders: [], placed: {}, order: [], collapsed: {} }
@@ -43,6 +43,29 @@ t = ops.deleteFolder(t, 'a')
 assert(Object.keys(t.placed).length === 0, 'deleting top folder returns chats to Unsorted')
 assert(ops.rename(ops.addFolder(t,null,'x','z'),'z','  ').folders[0].name === 'x', 'blank rename ignored')
 assert(plugin.id === 'pinned-folders' && typeof plugin.register === 'function', 'plugin shape')
+
+// General chat per folder (generalSession).
+{
+  let g = { folders: [], placed: {}, order: [], collapsed: {} }
+  g = ops.addFolder(g, null, 'GEEIS+', 'co'); g = ops.addFolder(g, 'co', 'Commercial', 'sub'); g = ops.addFolder(g, null, 'Tendr', 'co2')
+  assert(canHaveGeneral(g.folders[0]) && !canHaveGeneral(g.folders[1]), 'general chat: root folders only for now')
+  g = ops.setGeneral(g, 'co', 'gen')
+  assert(g.folders[0].generalSession === 'gen' && g.placed.gen === 'co', 'setGeneral sets the field and files the chat in the folder')
+  assert(generalIds(g).has('gen') && generalIds(g).size === 1, 'generalIds lists it')
+  g = ops.setGeneral(g, 'co2', 'gen')
+  assert(!g.folders[0].generalSession && g.folders[2].generalSession === 'gen' && g.placed.gen === 'co2', 'one chat is general of one folder only')
+  g = ops.placeSession(g, 'gen', 'sub')
+  assert(!g.folders[2].generalSession, 'moving the general chat out clears it')
+  g = ops.setGeneral(g, 'co', 'gen2'); g = ops.forgetSession(g, 'gen2')
+  assert(!g.folders[0].generalSession, 'deleting/archiving the general chat clears it')
+  g = ops.setGeneral(g, 'co', 'gen3'); g = ops.setGeneral(g, 'co', null)
+  assert(!('generalSession' in g.folders[0]) && g.placed.gen3 === 'co', 'removing keeps the chat filed in the folder')
+  assert(ops.setGeneral(g, 'nope', 'x') === g, 'unknown folder is a no-op')
+  const n = normalize({ folders: [{ id: 'a', name: 'A', parent: null, generalSession: 's' }], placed: {}, order: [] })
+  assert(n.folders[0].generalSession === 's', 'normalize keeps generalSession; absent = old behaviour')
+  const rt = importLayout(exportLayout(ops.setGeneral(g, 'co', 'gen4')))
+  assert(rt.folders.find(f => f.id === 'co').generalSession === 'gen4', 'export/import keeps generalSession')
+}
 
 // Tree helpers: ancestorsOf / isDescendant / folderOf edge cases.
 {
