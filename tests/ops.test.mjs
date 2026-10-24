@@ -25,7 +25,7 @@ export async function load(u, c, n) {
   return n(u, c)
 }`))
 const mod = await import(target.href)
-const { ops, normalize, folderActivity, filterView, ancestorsOf, isDescendant, folderOf, exportLayout, importLayout, generalIds, canHaveGeneral, default: plugin } = mod
+const { ops, normalize, folderActivity, filterView, ancestorsOf, isDescendant, folderOf, exportLayout, importLayout, generalIds, canHaveGeneral, slugify, folderPathCandidates, errText, default: plugin } = mod
 const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1) } else console.log('ok', m) }
 console.log('# build:', FULL ? 'full' : 'catalog')
 let t = { folders: [], placed: {}, order: [], collapsed: {} }
@@ -641,6 +641,28 @@ if (FULL) {
   const ledger = mem.get('autoJudged')
   assert(ledger.length === 1000 && ledger[0] === 'j19' && ledger[999] === 'k19',
     'markJudged caps the judged ledger at the newest 1000 ids, evicting the oldest')
+}
+
+// Folder -> devbox directory mapping (file explorer).
+{
+  let m = { folders: [], placed: {}, order: [], collapsed: {} }
+  for (const [id, n] of [['t', 'Tendr'], ['g', 'GEEIS+'], ['a', 'Apoleos'], ['p', 'Panorama'], ['pe', 'Perso'], ['h', 'GUYADER SI Consulting']]) m = ops.addFolder(m, null, n, id)
+  m = ops.addFolder(m, 'a', 'Produit & dev', 'a1'); m = ops.addFolder(m, 'a1', 'Été Prépa', 'a2')
+  const c = id => folderPathCandidates(m, id)
+  assert(slugify('Produit & dev') === 'produit-dev' && slugify('Été Prépa') === 'ete-prepa', 'slugify strips accents and symbols')
+  assert(c('t')[0] === '~/espaces/tendr' && c('g')[0] === '~/espaces/geeis' && c('a')[0] === '~/espaces/apoleos' && c('p')[0] === '~/espaces/panorama' && c('pe')[0] === '~/espaces/perso', 'root folders map to ~/espaces/<slug>')
+  assert(c('h').join() === '~/espaces/perso', 'GUYADER SI Consulting maps to perso')
+  assert(c('a1').join() === '~/espaces/apoleos/produit-dev,~/espaces/apoleos', 'subfolder: slug path first, parent as fallback')
+  assert(c('a2')[0] === '~/espaces/apoleos/produit-dev/ete-prepa' && c('a2').length === 3 && c('a2')[2] === '~/espaces/apoleos', 'depth 3: chain of fallbacks')
+  assert(c('nope').length === 0, 'unknown folder: no candidates')
+  m = { ...m, folders: m.folders.map(f => (f.id === 'a1' ? { ...f, path: '~/projects/x/' } : f)) }
+  assert(c('a1').join() === '~/projects/x', 'explicit path overrides the mapping')
+  assert(c('a2').join() === '~/projects/x/ete-prepa,~/projects/x', 'children of an overridden folder build on its path')
+  assert(normalize(m).folders.find(f => f.id === 'a1').path === '~/projects/x/', 'normalize keeps path')
+  const imp = importLayout(exportLayout(m))
+  assert(imp.folders.find(f => f.id === 'a1').path === '~/projects/x/', 'export/import keeps path')
+  assert(ops.rename(m, 'a1', 'Dev').folders.find(f => f.id === 'a1').path === '~/projects/x/', 'rename keeps path')
+  assert(errText(new Error('409: {"error":"existe déjà","exists":true}')) === 'existe déjà' && errText(new Error('500: boom')) === 'boom', 'errText extracts backend message')
 }
 
 // --- sdk-contract.mjs prints the checkout's ACTUAL short HEAD, never a

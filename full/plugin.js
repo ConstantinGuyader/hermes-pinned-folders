@@ -141,6 +141,57 @@ export function generalIds(t) {
 // now; the rest of the code is generic, so widening this is the only change.
 export const canHaveGeneral = f => !!f && !f.parent
 
+// ── folder -> devbox directory (file explorer) ───────────────────────────────
+// Slug of a folder name as used for directories: "Produit & dev" -> "produit-dev".
+export function slugify(name) {
+  return String(name || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+// Root folders that do not map to ~/espaces/<slug of their name>.
+const ROOT_DIR = { 'guyader-si-consulting': 'perso' }
+
+// Directories to try for a folder, best first; the backend opens the first one
+// that exists (and falls back to the home dir). A folder's own `path` field
+// overrides the mapping; otherwise root = ~/espaces/<slug>, subfolder =
+// <parent>/<slug> when it exists, else its parent's directory.
+export function folderPathCandidates(t, fid) {
+  const byId = new Map((t?.folders || []).map(f => [f.id, f]))
+  const chain = []
+  for (let cur = byId.get(fid), hops = 0; cur && hops < 1000; cur = byId.get(cur.parent), hops++) chain.unshift(cur)
+  if (!chain.length) return []
+  // Start from the deepest folder carrying an explicit path (if any).
+  let start = 0
+  let base = null
+  for (let i = chain.length - 1; i >= 0; i--) {
+    if (typeof chain[i].path === 'string' && chain[i].path.trim()) {
+      start = i
+      base = chain[i].path.trim().replace(/\/+$/, '') || '/'
+      break
+    }
+  }
+  const out = []
+  let cur
+  if (base === null) {
+    const slug = slugify(chain[0].name)
+    cur = '~/espaces/' + (ROOT_DIR[slug] || slug)
+    start = 0
+  } else cur = base
+  out.push(cur)
+  for (let i = start + 1; i < chain.length; i++) {
+    const s = slugify(chain[i].name)
+    if (s) {
+      cur = cur + '/' + s
+      out.push(cur)
+    }
+  }
+  return out.reverse()
+}
+
 export const ops = {
   addFolder(t, parent, name, id = newId()) {
     const collapsed = { ...t.collapsed }
@@ -499,7 +550,7 @@ export function importLayout(text) {
   if (!Array.isArray(v.folders)) throw new Error('The layout has no folder list.')
   const folders = v.folders
     .filter(f => f && typeof f.id === 'string' && typeof f.name === 'string')
-    .map(f => ({ id: f.id, name: f.name, parent: typeof f.parent === 'string' ? f.parent : null, ...(typeof f.color === 'string' ? { color: f.color } : {}), ...(typeof f.generalSession === 'string' && f.generalSession ? { generalSession: f.generalSession } : {}) }))
+    .map(f => ({ id: f.id, name: f.name, parent: typeof f.parent === 'string' ? f.parent : null, ...(typeof f.color === 'string' ? { color: f.color } : {}), ...(typeof f.generalSession === 'string' && f.generalSession ? { generalSession: f.generalSession } : {}), ...(typeof f.path === 'string' && f.path.trim() ? { path: f.path.trim() } : {}) }))
   const ids = new Set(folders.map(f => f.id))
   for (const f of folders) if (f.parent && !ids.has(f.parent)) f.parent = null
   // Break any cycle a hand-edited file might carry.
@@ -1195,11 +1246,414 @@ function NameInput({ initial, onDone }) {
   })
 }
 
+// ── devbox file explorer ("Fichiers") ────────────────────────────────────────
+// Everything goes through this plugin's backend (POST /fs/*, see
+// dashboard/plugin_api.py): it confines access to the devbox home dir and
+// refuses secrets. Opens as a main-area tab via host.openWorkspace.
+const FILES_ID = 'pinned-folders:files'
+let filesNonce = 0
+
+export function openFiles(candidates, title) {
+  if (!rest) return host.notifyError(new Error('No backend connection'), 'Impossible d’ouvrir les fichiers')
+  if (typeof host.openWorkspace !== 'function') return host.notifyError(new Error('openWorkspace unavailable'), 'Cette version de Hermes ne sait pas ouvrir de panneau')
+  const nonce = ++filesNonce
+  try {
+    host.openWorkspace(FILES_ID, {
+      title: title ? 'Fichiers · ' + title : 'Fichiers',
+      minWidth: '22rem',
+      render: () => jsx(FilesPane, { candidates: candidates && candidates.length ? candidates : ['~'] }, 'files:' + nonce)
+    })
+  } catch (err) {
+    host.notifyError(err, 'Impossible d’ouvrir les fichiers')
+  }
+}
+
+// ctx.rest rejects with "<status>: <body>"; pull out the readable part.
+export function errText(err) {
+  const m = String(err?.message || err || '')
+  const j = m.match(/\{[\s\S]*\}/)
+  if (j) {
+    try {
+      const o = JSON.parse(j[0])
+      if (o && typeof o.error === 'string') return o.error
+    } catch {}
+  }
+  return m.replace(/^\d{3}:\s*/, '') || 'Erreur'
+}
+const errStatus = err => Number(String(err?.message || '').match(/^(\d{3})/)?.[1] || 0)
+
+const fsCall = (name, body) => rest('/fs/' + name, { method: 'POST', body })
+
+function toBase64(buf) {
+  const b = new Uint8Array(buf)
+  let s = ''
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000))
+  return btoa(s)
+}
+function fromBase64(b64, mime) {
+  const bin = atob(b64)
+  const arr = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i)
+  return new Blob([arr], { type: mime || 'application/octet-stream' })
+}
+const sizeLabel = n => (n < 1024 ? n + ' o' : n < 1048576 ? (n / 1024).toFixed(1).replace('.0', '') + ' Ko' : (n / 1048576).toFixed(1).replace('.0', '') + ' Mo')
+const dateLabel = s => (s ? new Date(s * 1000).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' }) : '')
+const joinPath = (dir, name) => (dir.endsWith('/') ? dir : dir + '/') + name
+
+function iconFor(e) {
+  if (e.type === 'dir') return 'folder'
+  const n = e.name.toLowerCase()
+  if (/\.(png|jpe?g|gif|webp|svg|bmp|ico)$/.test(n)) return 'file-media'
+  if (/\.pdf$/.test(n)) return 'file-pdf'
+  if (/\.(zip|tar|gz|tgz|7z|rar)$/.test(n)) return 'file-zip'
+  return 'file'
+}
+
+function FileNameDialog({ open, title, label, initial, confirm, onClose, onSubmit }) {
+  const [value, setValue] = useState(initial || '')
+  useEffect(() => {
+    if (open) setValue(initial || '')
+  }, [open, initial])
+  const submit = () => {
+    if (value.trim()) onSubmit(value.trim())
+  }
+  return jsx(Dialog, {
+    open,
+    onOpenChange: o => !o && onClose(),
+    children: jsxs(DialogContent, {
+      children: [
+        jsx(DialogHeader, { children: jsx(DialogTitle, { children: title }) }, 'h'),
+        jsx(Input, {
+          value,
+          autoFocus: true,
+          'aria-label': label,
+          placeholder: label,
+          onChange: e => setValue(e.target.value),
+          onKeyDown: e => {
+            e.stopPropagation()
+            if (e.key === 'Enter') submit()
+          }
+        }, 'i'),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { variant: 'ghost', onClick: onClose, children: 'Annuler' }, 'c'),
+            jsx(Button, { disabled: !value.trim(), onClick: submit, children: confirm }, 'ok')
+          ]
+        }, 'f')
+      ]
+    })
+  })
+}
+
+function FilePreview({ file, onBack, onSaved, onError, onCopy, onDownload }) {
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState(null)
+  const [url, setUrl] = useState(null)
+  const [editing, setEditing] = useState(false)
+  const [text, setText] = useState('')
+  const [saving, setSaving] = useState(false)
+  useEffect(() => {
+    let dead = false
+    let objUrl = null
+    setData(null)
+    setErr(null)
+    setEditing(false)
+    fsCall('read', { path: file.path })
+      .then(r => {
+        if (dead) return
+        if (r.kind === 'image' || r.kind === 'pdf') {
+          objUrl = URL.createObjectURL(fromBase64(r.base64, r.mime))
+          setUrl(objUrl)
+        }
+        setText(r.text || '')
+        setData(r)
+      })
+      .catch(e => !dead && setErr(errText(e)))
+    return () => {
+      dead = true
+      if (objUrl) URL.revokeObjectURL(objUrl)
+    }
+  }, [file.path])
+  const save = async () => {
+    setSaving(true)
+    try {
+      await fsCall('write', { path: file.path, text, overwrite: true })
+      setData(d => ({ ...d, text, size: new Blob([text]).size }))
+      setEditing(false)
+      onSaved()
+    } catch (e) {
+      onError(e, 'Enregistrement impossible')
+    }
+    setSaving(false)
+  }
+  const body = err
+    ? jsx('div', { className: 'text-destructive', style: { padding: 12, fontSize: '0.8125rem' }, children: err })
+    : !data
+      ? jsx('div', { className: 'text-(--ui-text-tertiary)', style: { padding: 12, fontSize: '0.8125rem' }, children: 'Chargement…' })
+      : data.kind === 'image'
+        ? jsx('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: 12, textAlign: 'center' }, children: jsx('img', { src: url, alt: file.name, style: { maxWidth: '100%' } }) })
+        : data.kind === 'pdf'
+          ? jsx('iframe', { src: url, title: file.name, style: { flex: 1, minHeight: 0, border: 0, width: '100%' } })
+          : data.kind === 'binary'
+            ? jsx('div', { className: 'text-(--ui-text-tertiary)', style: { padding: 12, fontSize: '0.8125rem' }, children: 'Fichier binaire (' + sizeLabel(data.size) + ') : pas d’aperçu. Utilisez « Télécharger ».' })
+            : editing
+              ? jsx('textarea', {
+                  value: text,
+                  spellCheck: false,
+                  onChange: e => setText(e.target.value),
+                  className: 'border border-(--ui-border) bg-transparent text-foreground',
+                  style: { flex: 1, minHeight: 0, margin: 8, borderRadius: 6, padding: 8, fontFamily: 'var(--font-mono, monospace)', fontSize: '0.75rem', resize: 'none' }
+                })
+              : jsx('pre', {
+                  style: { flex: 1, minHeight: 0, margin: 0, padding: 12, overflow: 'auto', fontFamily: 'var(--font-mono, monospace)', fontSize: '0.75rem', whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text' },
+                  children: data.text
+                })
+  const canEdit = data?.kind === 'text' && !data.truncated
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 },
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px', flexShrink: 0 },
+        children: [
+          jsx(IconButton, { icon: 'arrow-left', title: 'Retour à la liste', onClick: onBack }, 'b'),
+          jsx('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '0.8125rem' }, title: file.path, children: file.name }, 'n'),
+          data?.truncated ? jsx('span', { className: 'text-(--ui-text-tertiary)', style: { fontSize: '0.75rem' }, children: 'Aperçu tronqué (2 Mo)' }, 'tr') : null,
+          editing
+            ? [
+                jsx(Button, { size: 'sm', variant: 'ghost', onClick: () => (setText(data.text), setEditing(false)), children: 'Annuler' }, 'ca'),
+                jsx(Button, { size: 'sm', disabled: saving, onClick: save, children: 'Enregistrer' }, 'sv')
+              ]
+            : [
+                canEdit ? jsx(IconButton, { icon: 'edit', title: 'Modifier', onClick: () => setEditing(true) }, 'ed') : null,
+                jsx(IconButton, { icon: 'copy', title: 'Copier le chemin', onClick: onCopy }, 'cp'),
+                jsx(IconButton, { icon: 'cloud-download', title: 'Télécharger', onClick: onDownload }, 'dl')
+              ]
+        ]
+      }, 'bar'),
+      body
+    ]
+  })
+}
+
+function FilesPane({ candidates }) {
+  const [listing, setListing] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [selected, setSelected] = useState(null)
+  const [preview, setPreview] = useState(null)
+  const [dialog, setDialog] = useState(null) // { kind: 'mkdir' | 'rename' | 'delete' | 'overwrite', ... }
+  const inputRef = useRef(null)
+  const linkRef = useRef(null)
+  const dir = listing?.path
+
+  const notifyErr = (err, title) => host.notifyError(new Error(errText(err)), title)
+  const load = async (call, body) => {
+    setLoading(true)
+    setError(null)
+    try {
+      const r = await fsCall(call, body)
+      setListing(r)
+      setSelected(null)
+    } catch (err) {
+      setError(errText(err))
+    }
+    setLoading(false)
+  }
+  const go = path => {
+    setPreview(null)
+    return load('list', { path })
+  }
+  const refresh = () => (dir ? load('list', { path: dir }) : load('open', { candidates }))
+  useEffect(() => {
+    load('open', { candidates })
+  }, [])
+
+  const copyPath = path => {
+    Promise.resolve(os?.writeClipboard?.(path)).then(ok => host.notify({ kind: ok === false ? 'error' : 'success', message: ok === false ? 'Copie impossible' : 'Chemin copié', durationMs: 1500 }))
+  }
+  const download = async e => {
+    try {
+      const r = await fsCall('download', { path: e.path })
+      const a = linkRef.current
+      const u = URL.createObjectURL(fromBase64(r.base64, r.mime))
+      a.href = u
+      a.download = r.name
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(u), 10000)
+    } catch (err) {
+      notifyErr(err, 'Téléchargement impossible')
+    }
+  }
+  const upload = async (file, overwrite) => {
+    if (file.size > 25 * 1024 * 1024) return host.notifyError(new Error('25 Mo maximum'), 'Fichier trop volumineux')
+    const path = joinPath(dir, file.name)
+    try {
+      await fsCall('write', { path, base64: toBase64(await file.arrayBuffer()), overwrite: !!overwrite })
+      host.notify({ kind: 'success', message: file.name + ' envoyé', durationMs: 1800 })
+      refresh()
+    } catch (err) {
+      if (errStatus(err) === 409) setDialog({ kind: 'overwrite', file })
+      else notifyErr(err, 'Envoi impossible')
+    }
+  }
+  const doMkdir = async name => {
+    setDialog(null)
+    try {
+      await fsCall('mkdir', { path: joinPath(dir, name) })
+      refresh()
+    } catch (err) {
+      notifyErr(err, 'Création impossible')
+    }
+  }
+  const doRename = async (e, name) => {
+    setDialog(null)
+    try {
+      await fsCall('rename', { path: e.path, new_name: name })
+      if (preview?.path === e.path) setPreview(null)
+      refresh()
+    } catch (err) {
+      notifyErr(err, 'Renommage impossible')
+    }
+  }
+  const doDelete = async e => {
+    try {
+      await fsCall('delete', { path: e.path })
+      if (preview?.path === e.path) setPreview(null)
+      refresh()
+    } catch (err) {
+      notifyErr(err, 'Suppression impossible')
+      throw err
+    }
+  }
+  const open = e => {
+    if (e.type === 'dir') go(e.path)
+    else setPreview(e)
+  }
+
+  const entries = (listing?.entries || []).map(e => ({ ...e, path: joinPath(dir, e.name) }))
+  const rel = listing ? listing.path.slice(listing.home.length).split('/').filter(Boolean) : []
+  const crumbs = listing ? [{ label: '~', path: listing.home }, ...rel.map((s, i) => ({ label: s, path: listing.home + '/' + rel.slice(0, i + 1).join('/') }))] : []
+
+  const menuFor = e => [
+    { label: e.type === 'dir' ? 'Ouvrir' : 'Aperçu', icon: e.type === 'dir' ? 'folder-opened' : 'eye', onSelect: () => open(e) },
+    ...(e.type === 'file' ? [{ label: 'Télécharger', icon: 'cloud-download', onSelect: () => download(e) }] : []),
+    { label: 'Copier le chemin', icon: 'copy', onSelect: () => copyPath(e.path) },
+    '-',
+    { label: 'Renommer', icon: 'edit', onSelect: () => setDialog({ kind: 'rename', entry: e }) },
+    { label: 'Supprimer', icon: 'trash', onSelect: () => setDialog({ kind: 'delete', entry: e }) }
+  ]
+
+  const row = e => {
+    const sel = selected === e.name
+    const el = jsxs('div', {
+      role: 'button',
+      className: 'hover:bg-(--ui-control-hover-background)' + (sel ? ' bg-(--ui-control-hover-background)' : ''),
+      style: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 10px', cursor: 'pointer', fontSize: '0.8125rem' },
+      onClick: () => setSelected(e.name),
+      onDoubleClick: () => open(e),
+      children: [
+        jsx(Codicon, { name: iconFor(e), size: '0.875rem' }, 'i'),
+        jsx('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: e.name, children: e.name }, 'n'),
+        jsx('span', { className: 'text-(--ui-text-tertiary)', style: { width: 64, textAlign: 'right', fontSize: '0.75rem', flexShrink: 0 }, children: e.type === 'dir' ? '' : sizeLabel(e.size) }, 's'),
+        jsx('span', { className: 'text-(--ui-text-tertiary)', style: { width: 112, textAlign: 'right', fontSize: '0.75rem', flexShrink: 0 }, children: dateLabel(e.mtime) }, 'd'),
+        jsx(RowMenu, { items: menuFor(e) }, 'm')
+      ]
+    })
+    return jsx(WithContextMenu, { items: menuFor(e), children: el }, e.name)
+  }
+
+  const toolbar = jsxs('div', {
+    style: { display: 'flex', alignItems: 'center', gap: 4, padding: '6px 8px', flexShrink: 0 },
+    children: [
+      jsx(IconButton, { icon: 'arrow-up', title: 'Dossier parent', onClick: () => listing?.parent && go(listing.parent) }, 'up'),
+      jsx('div', {
+        style: { flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', flexWrap: 'wrap', fontSize: '0.8125rem' },
+        children: crumbs.map((c, i) =>
+          jsxs('span', {
+            style: { display: 'inline-flex', alignItems: 'center' },
+            children: [
+              i ? jsx('span', { className: 'text-(--ui-text-tertiary)', style: { margin: '0 2px' }, children: '›' }, 'sep') : null,
+              jsx('button', {
+                type: 'button',
+                className: 'hover:bg-(--ui-control-hover-background)' + (i === crumbs.length - 1 ? '' : ' text-(--ui-text-secondary)'),
+                style: { padding: '1px 4px', borderRadius: 4 },
+                onClick: () => go(c.path),
+                children: c.label
+              }, 'b')
+            ]
+          }, c.path)
+        )
+      }, 'crumbs'),
+      jsx(IconButton, { icon: 'copy', title: 'Copier le chemin', onClick: () => dir && copyPath(dir) }, 'cp'),
+      jsx(IconButton, { icon: 'refresh', title: 'Actualiser', onClick: refresh }, 'rf'),
+      jsx(IconButton, { icon: 'new-folder', title: 'Nouveau dossier', onClick: () => setDialog({ kind: 'mkdir' }) }, 'nf'),
+      jsx(IconButton, { icon: 'cloud-upload', title: 'Envoyer un fichier ici', onClick: () => inputRef.current?.click() }, 'up2'),
+      jsx('input', {
+        ref: inputRef,
+        type: 'file',
+        multiple: true,
+        style: { display: 'none' },
+        onChange: ev => {
+          const files = [...ev.target.files]
+          ev.target.value = ''
+          files.forEach(f => upload(f, false))
+        }
+      }, 'file')
+    ]
+  })
+
+  const list = error
+    ? jsx('div', { className: 'text-destructive', style: { padding: 12, fontSize: '0.8125rem' }, children: error }, 'err')
+    : jsxs('div', {
+        style: { flex: 1, minHeight: 0, overflowY: 'auto' },
+        children: [
+          loading && !listing ? jsx('div', { className: 'text-(--ui-text-tertiary)', style: { padding: 12, fontSize: '0.8125rem' }, children: 'Chargement…' }, 'ld') : null,
+          listing && !entries.length ? jsx('div', { className: 'text-(--ui-text-tertiary)', style: { padding: 12, fontSize: '0.8125rem' }, children: 'Dossier vide' }, 'em') : null,
+          entries.map(row),
+          listing?.truncated ? jsx('div', { className: 'text-(--ui-text-tertiary)', style: { padding: 8, fontSize: '0.75rem' }, children: 'Liste tronquée (5000 entrées)' }, 'tr') : null
+        ]
+      })
+
+  const entryOf = dialog?.entry
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
+    children: [
+      jsx('a', { ref: linkRef, style: { display: 'none' }, 'aria-hidden': true, tabIndex: -1 }, 'lnk'),
+      preview
+        ? jsx(FilePreview, { file: preview, onBack: () => setPreview(null), onSaved: refresh, onError: notifyErr, onCopy: () => copyPath(preview.path), onDownload: () => download(preview) }, 'pv')
+        : [toolbar, list],
+      jsx(FileNameDialog, { open: dialog?.kind === 'mkdir', title: 'Nouveau dossier', label: 'Nom du dossier', confirm: 'Créer', onClose: () => setDialog(null), onSubmit: doMkdir }, 'mk'),
+      jsx(FileNameDialog, { open: dialog?.kind === 'rename', title: 'Renommer', label: 'Nouveau nom', initial: entryOf?.name, confirm: 'Renommer', onClose: () => setDialog(null), onSubmit: n => doRename(entryOf, n) }, 'rn'),
+      jsx(ConfirmDialog, {
+        open: dialog?.kind === 'delete',
+        onClose: () => setDialog(null),
+        onConfirm: () => doDelete(entryOf),
+        title: entryOf?.type === 'dir' ? 'Supprimer ce dossier ?' : 'Supprimer ce fichier ?',
+        description: `« ${entryOf?.name || ''} » ${entryOf?.type === 'dir' ? 'et tout son contenu seront supprimés' : 'sera supprimé'} définitivement de la devbox. Cette action est irréversible.`,
+        confirmLabel: 'Supprimer',
+        cancelLabel: 'Annuler',
+        destructive: true
+      }, 'del'),
+      jsx(ConfirmDialog, {
+        open: dialog?.kind === 'overwrite',
+        onClose: () => setDialog(null),
+        onConfirm: () => upload(dialog.file, true),
+        title: 'Remplacer ce fichier ?',
+        description: `« ${dialog?.file?.name || ''} » existe déjà dans ce dossier. Le remplacer ?`,
+        confirmLabel: 'Remplacer',
+        cancelLabel: 'Annuler',
+        destructive: true
+      }, 'ow')
+    ]
+  })
+}
+
 const NAV = [
   { icon: 'edit', label: 'Nouvelle session', run: () => host.newChat?.() },
   { icon: 'extensions', label: 'Capacités', run: () => host.navigate('/capabilities') },
   { icon: 'comment-discussion', label: 'Messagerie', run: () => host.navigate('/messaging') },
   { icon: 'files', label: 'Artefacts', run: () => host.navigate('/artifacts') },
+  { icon: 'folder-opened', label: 'Fichiers', run: () => openFiles(['~']) },
   { icon: 'watch', label: 'Tâches planifiées', run: () => host.navigate('/cron') }
 ]
 
@@ -1635,6 +2089,7 @@ function PinnedPane() {
       : []
     const items = [
       { label: 'Open all as tabs' + (total ? ` (${total})` : ''), icon: 'multiple-windows', disabled: !total, onSelect: () => openAllAsTabs(f.id) },
+      { label: 'Ouvrir les fichiers', icon: 'folder-opened', onSelect: () => openFiles(folderPathCandidates(tree, f.id), f.name) },
       '-',
       { label: 'New subfolder', icon: 'new-folder', onSelect: () => newFolder(f.id) },
       // #full
