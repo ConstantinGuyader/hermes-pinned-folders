@@ -476,7 +476,8 @@ const { normalizeView, narrowView, orderRows, applyView, DEFAULT_VIEW } = mod
 const legacy = { folders: [{ id: 'w', name: 'Work', parent: null, color: 'hsl(1 2% 3%)' }], placed: { a: 'w' }, order: ['a'], collapsed: { w: true }, foldersOrdered: true }
 const loaded = normalize(JSON.parse(JSON.stringify(legacy)))
 assert(JSON.stringify(loaded.view) === JSON.stringify(DEFAULT_VIEW), 'old layout without view state loads with default view')
-assert(JSON.stringify({ ...loaded, view: undefined }) === JSON.stringify({ ...legacy, view: undefined }), 'old layout keeps folders, colors, placement, order, collapse unchanged')
+assert(loaded.pinned.length === 0, 'old layout loads with no pinned chats')
+assert(JSON.stringify({ ...loaded, view: undefined, pinned: undefined }) === JSON.stringify({ ...legacy, view: undefined }), 'old layout keeps folders, colors, placement, order, collapse unchanged')
 assert(JSON.stringify(normalizeView({ order: 'sideways', status: 42, unreadOnly: 'yes' })) === JSON.stringify(DEFAULT_VIEW), 'garbage view values fall back to defaults')
 // ── normalizeView edges: the persisted-view migration boundary. This function
 // rewrites user view state on every load, so "never break user state" applies to
@@ -692,4 +693,13 @@ if (FULL) {
   assert(rGit.stdout.includes('resolved at ' + head),
     'sdk-contract OK line carries the checkout short HEAD (' + head + '), not a fixed label')
   rmSync(dir, { recursive: true, force: true })
+}
+
+// ── pinned section (togglePin) ──
+{
+  const t0 = normalize({ folders: [], placed: { a: 'x' }, order: ['a'], foldersOrdered: true })
+  const t1 = ops.togglePin(t0, 'a'); assert(t1.pinned.join() === 'a', 'togglePin pins a chat')
+  const t2 = ops.togglePin(ops.togglePin(t1, 'b'), 'a'); assert(t2.pinned.join() === 'b', 'togglePin unpins and keeps order')
+  assert(ops.forgetSession(t1, 'a').pinned.length === 0, 'forgetSession drops the pin')
+  assert(mod.sharedPart(t1).pinned.join() === 'a', 'pins are part of the synced layout')
 }

@@ -90,7 +90,7 @@ export function normalizeView(v) {
   return { order: pick('order'), unreadOnly: src.unreadOnly === true, status: pick('status'), profile: pick('profile') }
 }
 
-const empty = () => ({ folders: [], placed: {}, order: [], collapsed: {}, foldersOrdered: true, view: { ...DEFAULT_VIEW } })
+const empty = () => ({ folders: [], placed: {}, order: [], pinned: [], collapsed: {}, foldersOrdered: true, view: { ...DEFAULT_VIEW } })
 
 // Folder order is the user's (array order). Layouts saved before manual
 // ordering existed were shown alphabetically, so sort them once on load.
@@ -104,6 +104,7 @@ export function normalize(v) {
     folders,
     placed: v.placed && typeof v.placed === 'object' ? v.placed : {},
     order: Array.isArray(v.order) ? v.order : [],
+    pinned: Array.isArray(v.pinned) ? v.pinned.filter(x => typeof x === 'string') : [],
     collapsed: v.collapsed && typeof v.collapsed === 'object' ? v.collapsed : {},
     foldersOrdered: true,
     view: normalizeView(v.view)
@@ -261,10 +262,17 @@ export const ops = {
   },
   forgetSession(t, sid) {
     t = clearGeneralElsewhere(t, sid, undefined)
-    if (!(sid in t.placed) && !t.order.includes(sid)) return t
+    const pinned = (t.pinned || []).filter(x => x !== sid)
+    if (!(sid in t.placed) && !t.order.includes(sid) && pinned.length === (t.pinned || []).length) return t
     const placed = { ...t.placed }
     delete placed[sid]
-    return { ...t, placed, order: t.order.filter(x => x !== sid) }
+    return { ...t, placed, pinned, order: t.order.filter(x => x !== sid) }
+  },
+  // Pinned chats are shown in an "Épinglées" section at the top (they also
+  // stay in their folder). Toggling keeps the user's pin order.
+  togglePin(t, sid) {
+    const cur = t.pinned || []
+    return { ...t, pinned: cur.includes(sid) ? cur.filter(x => x !== sid) : [...cur, sid] }
   },
   toggle(t, id) {
     const collapsed = { ...t.collapsed }
@@ -497,6 +505,7 @@ export function chatMenuItems(row, { fid, flat, canUnpin, act }) {
     { label: 'Open in new tab', icon: 'split-horizontal', onSelect: () => act.open('tab') },
     { label: 'Open in new window', icon: 'link-external', onSelect: () => act.open('window') },
     '-',
+    { label: act.isPinned ? 'Désépingler' : 'Épingler en haut', icon: act.isPinned ? 'pinned' : 'pin', onSelect: act.togglePin },
     { label: 'Rename', icon: 'edit', onSelect: act.rename },
     // #full
     { label: row.unread ? 'Mark as read' : 'Mark as unread', icon: row.unread ? 'mail-read' : 'mail', onSelect: act.toggleRead },
@@ -747,7 +756,7 @@ const SYNC_MS = 4000
 const PUSH_DELAY_MS = 400
 
 export function sharedPart(t) {
-  return { folders: t.folders, placed: t.placed, order: t.order, foldersOrdered: true }
+  return { folders: t.folders, placed: t.placed, order: t.order, pinned: t.pinned || [], foldersOrdered: true }
 }
 
 // Server layout + this app's local-only fields -> the tree to show.
@@ -1966,7 +1975,7 @@ function PinnedPane() {
           : null
 
   // ── rows ──
-  const sessionRow = (row, depth) => {
+  const sessionRow = (row, depth, keyPrefix = '') => {
     const fid = folderOf(tree, folderIds, row.id)
     // One unpin handler for the menu item and the ⇧-click gesture.
     const unpin = () => {
@@ -1994,6 +2003,8 @@ function PinnedPane() {
         unpin,
         del: () => setDeleting(row),
         rename: () => setEditing('s:' + row.id),
+        isPinned: (tree.pinned || []).includes(row.id),
+        togglePin: () => setTree(t => ops.togglePin(t, row.id)),
         // #full
         toggleRead: () => toggleRead(row),
         archive: () => archiveRow(row)
@@ -2018,6 +2029,13 @@ function PinnedPane() {
         }),
         title: (row.title || row.preview || row.id) + (canUnpin ? '\nShift-click to unpin' : ''),
         onClick: e => !renaming && handlePinnedRowClick(e, { open: intent => openRow(row, intent), unpin }),
+        onMouseDown: e => { if (e.button === 1) e.preventDefault() },
+        onAuxClick: e => {
+          if (e.button !== 1 || renaming) return
+          e.preventDefault()
+          e.stopPropagation()
+          openRow(row, 'tab')
+        },
         // #full
         onDoubleClick: e => {
           e.stopPropagation()
@@ -2050,7 +2068,7 @@ function PinnedPane() {
         ]
       }
     )
-    return jsx(WithContextMenu, { items, children: el }, 's:' + row.id)
+    return jsx(WithContextMenu, { items, children: el }, keyPrefix + 's:' + row.id)
   }
 
   const folderRow = (f, depth) => {
@@ -2275,13 +2293,31 @@ function PinnedPane() {
   const note = text =>
     jsx('div', { className: 'text-(--ui-text-tertiary)', style: { padding: '8px 10px', fontSize: '0.75rem' }, children: text }, 'note')
 
+  const byIdAll = new Map((rows || []).map(r => [r.id, r]))
+  const pinnedList = visibleRows((tree.pinned || []).map(id => byIdAll.get(id)).filter(Boolean), view)
+  const pinnedOpen = view ? true : !tree.collapsed.__pinned
+  const pinnedRows = !pinnedList.length ? [] : [
+    jsxs('div', {
+      className: 'hover:bg-(--ui-control-hover-background)',
+      style: rowStyle(0),
+      onClick: () => !view && setTree(t => ops.toggle(t, '__pinned')),
+      children: [
+        jsx(DisclosureCaret, { open: pinnedOpen, className: 'text-(--ui-text-tertiary)' }, 'caret'),
+        jsx(Codicon, { name: 'pinned', size: '0.875rem', className: 'text-(--ui-text-tertiary)' }, 'icon'),
+        jsx('span', { style: { flex: 1, fontWeight: 500 }, className: 'text-(--ui-text-secondary)', children: 'Épinglées' }, 'name'),
+        jsx('span', { className: 'text-(--ui-text-quaternary)', style: { fontSize: '0.6875rem', paddingRight: 24 }, children: pinnedList.length }, 'n')
+      ]
+    }, 'pinned-head'),
+    ...(pinnedOpen ? pinnedList.map(r => sessionRow(r, 1, 'pin:')) : [])
+  ]
+
   let body
   if (rows == null && !error) {
     body = [note('Loading pinned chats…')]
   } else if (rows == null) {
     body = [note('Could not load pinned chats: ' + error)]
   } else {
-    body = [...(childFolders.get(ROOT) || []).flatMap(f => folderRow(f, 0)), ...unsortedRows]
+    body = [...pinnedRows, ...(childFolders.get(ROOT) || []).flatMap(f => folderRow(f, 0)), ...unsortedRows]
     if (rows.length === 0) body.push(note('Aucune conversation pour l’instant.'))
     else if (view && !body.length) body.push(note(query.trim() ? 'Nothing matches “' + query.trim() + '”.' : 'No pinned chats match this view.'))
   }
