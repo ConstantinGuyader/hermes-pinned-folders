@@ -518,6 +518,7 @@ export function chatMenuItems(row, { fid, flat, canUnpin, act }) {
       disabled: !canUnpin,
       onSelect: act.unpin
     },
+    { label: 'Archiver', icon: 'archive', onSelect: act.archive },
     '-',
     { label: 'Delete…', icon: 'trash', destructive: true, onSelect: act.del }
   ]
@@ -1521,6 +1522,23 @@ function PinnedPane() {
     })
   }
 
+  // Archive goes through this plugin's backend (POST /archive), so it works
+  // in the catalog build too, like rename.
+  const archiveRow = row => {
+    if (!rest) {
+      host.notifyError(new Error('No backend connection'), 'Impossible d’archiver cette conversation')
+      return
+    }
+    dropRow(row.id)
+    setTree(t => ops.forgetSession(t, row.id))
+    rest('/archive', { method: 'POST', body: { session_id: row.id, archived: true, ...(row.profile ? { profile: row.profile } : {}) } })
+      .then(() => host.notify({ kind: 'success', message: 'Conversation archivée', durationMs: 2000 }))
+      .catch(err => {
+        host.notifyError(err, 'Impossible d’archiver cette conversation')
+        refreshRows()
+      })
+  }
+
   // Sequential on purpose: each open settles before the next tab is made.
   // Only the chats the folder shows (same selector as the render).
   const openAllAsTabs = async fid => {
@@ -1671,6 +1689,7 @@ function PinnedPane() {
         rename: () => setEditing('s:' + row.id),
         isPinned: (tree.pinned || []).includes(row.id),
         togglePin: () => setTree(t => ops.togglePin(t, row.id)),
+        archive: () => archiveRow(row),
       }
     })
     const active = focused && focused === row.id
@@ -1699,6 +1718,9 @@ function PinnedPane() {
           openRow(row, 'tab')
         },
         children: [
+          (tree.pinned || []).includes(row.id)
+            ? jsx('span', { title: 'Épinglée', className: 'text-(--ui-text-tertiary)', style: { display: 'grid', placeItems: 'center', flexShrink: 0, marginRight: -2 }, children: jsx(Codicon, { name: 'pinned', size: '0.6875rem' }) }, 'pin')
+            : null,
           jsx(SidebarRowLead, { children: jsx(SessionStatusDot, { storedSessionId: row.id, session: row }) }, 'dot'),
           renaming
             ? jsx(

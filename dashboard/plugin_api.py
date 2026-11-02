@@ -8,6 +8,7 @@ edit is picked up by the apps on their next poll).
 
 Routes (mounted at /api/plugins/pinned-folders/):
   GET  /layout  -> {"rev": str|None, "layout": dict|None}
+  POST /archive body {"session_id", "archived"?: bool, "profile"?} -> {"ok", "archived"}
   PUT  /layout  body {"layout": dict, "base": str|None}
                -> {"rev": str, "layout": dict}, or 409 {"rev", "layout"} when
                   ``base`` is given and no longer matches the file (someone else
@@ -134,6 +135,29 @@ def set_title(payload: dict = Body(...)):
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
     return {"ok": True, "title": title}
+
+
+@router.post("/archive")
+def set_archived(payload: dict = Body(...)):
+    """Archive (or unarchive) a chat in the owning profile's state.db: same
+    deliberate archive as the app's Sessions menu (messages are kept)."""
+    sid = str((payload or {}).get("session_id") or "").strip()
+    archived = bool((payload or {}).get("archived", True))
+    profile = str((payload or {}).get("profile") or "default").strip() or "default"
+    if not sid:
+        return JSONResponse({"error": "session_id required"}, status_code=400)
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_state import SessionDB
+
+    db = SessionDB(Path(get_profile_dir(profile)) / "state.db")
+    try:
+        if not db.set_session_archived(sid, archived):
+            return JSONResponse({"error": "unknown session"}, status_code=404)
+    finally:
+        close = getattr(db, "close", None)
+        if callable(close):
+            close()
+    return {"ok": True, "archived": archived}
 
 
 # ── devbox file explorer ─────────────────────────────────────────────────────
