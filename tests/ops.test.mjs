@@ -416,11 +416,16 @@ assert(pinnedRowClick({ altKey: true, shiftKey: true }) === 'open' && pinnedRowC
 const menuAct = { open: () => {}, copyId: () => {}, place: () => {}, unpin: () => {}, del: () => {}, rename: () => {}, toggleRead: () => {}, archive: () => {} }
 const menu = chatMenuItems({ id: 's1' }, { fid: null, flat: [], canUnpin: true, act: menuAct })
 const labels = menu.filter(it => it && it.label).map(it => it.label)
-assert(['Open', 'Open in new tab', 'Open in new window', 'Copy session ID', 'Unpin', 'Delete…'].every(l => labels.includes(l)),
+assert(['Open', 'Open in new tab', 'Open in new window', 'Copy session ID', 'Épingler', 'Archiver', 'Delete…'].every(l => labels.includes(l)),
   'context/kebab menu keeps its items: ' + labels.join('|'))
-assert(menu.find(it => it.label === 'Unpin').onSelect === menuAct.unpin, 'menu Unpin and the shift+click gesture share one handler')
-const oldMenu = chatMenuItems({ id: 's1' }, { fid: null, flat: [], canUnpin: false, act: menuAct })
-assert(oldMenu.find(it => /^Unpin/.test(it.label || '')).disabled === true, 'menu Unpin stays disabled with guidance when unpin is unavailable')
+assert(!labels.some(l => /^Unpin/.test(l)), 'no core Unpin item: one pin notion only (the plugin pin)')
+{
+  const { narrowView } = mod
+  const tp = { folders: [{ id: 'f', name: 'F', parent: null }], placed: { a: 'f', b: 'f' }, order: [], pinned: ['a'], collapsed: {} }
+  const v = narrowView(tp, [{ id: 'a' }, { id: 'b' }, { id: 'c' }], '', { pinnedOnly: true }, 'default')
+  assert(v.chats.has('a') && !v.chats.has('b') && !v.chats.has('c') && v.folders.has('f'), 'Épinglées seulement keeps pinned chats in their folders, hides the rest')
+  assert(ops.togglePin(tp, 'b').placed.b === 'f', 'pinning leaves the chat where it is filed')
+}
 
 // ── click gestures + chatMenuItems: delta batch — complements the #12-era
 // click tests above. That block already covers bare/shift/meta clicks through
@@ -462,9 +467,6 @@ assert(pinnedRowClick({ ...GD, ctrlKey: true }) === 'tab', 'gesture: ctrl opens 
   assert(fm.find(it => it.label === 'Unsorted').disabled === false, 'Unsorted is enabled while the chat sits in a folder')
   assert(chatMenuItems({ id: 's1' }, { fid: null, flat: [], canUnpin: true, act: menuAct }).find(it => it.label === 'Unsorted').disabled === true,
     'Unsorted is disabled when the chat is already Unsorted (fid === ROOT)')
-  const noUnpin = chatMenuItems({ id: 's1' }, { fid: null, flat: [], canUnpin: false, act: menuAct }).find(it => /^Unpin/.test(it.label || ''))
-  assert(/update Desktop/i.test(noUnpin.label),
-    'canUnpin=false: Unpin label names the fix (update Desktop)')
   assert(fm.find(it => it.label === 'Delete…').destructive === true, "Delete… is the menu's destructive entry")
   const tabCalls = []
   chatMenuItems({ id: 's1' }, { fid: 'i', flat, canUnpin: true, act: { ...menuAct, open: i => tabCalls.push(i) } })
@@ -484,7 +486,7 @@ assert(JSON.stringify(normalizeView({ order: 'sideways', status: 42, unreadOnly:
 // it field-by-field: valid survives untouched, invalid repairs alone, truthy
 // non-true never counts as a filter.
 {
-  const nvFull = { order: 'recent', unreadOnly: true, status: 'working', profile: 'current' }
+  const nvFull = { order: 'recent', unreadOnly: true, pinnedOnly: true, status: 'working', profile: 'current' }
   assert(JSON.stringify(normalizeView(nvFull)) === JSON.stringify(nvFull), 'a fully-valid view passes through byte-identical (no silent coercion of user state)')
   const nvHalf = normalizeView({ order: 'recent', status: 'nope', profile: 'current' })
   assert(nvHalf.order === 'recent' && nvHalf.profile === 'current' && nvHalf.status === 'all' && nvHalf.unreadOnly === false,

@@ -72,13 +72,13 @@ let rest = null // ctx.rest (this plugin's backend namespace), set in register()
 
 // View options from the filter menu: how chats are ordered and which are
 // shown. They never touch folders, colors, placement or collapse state.
-export const DEFAULT_VIEW = Object.freeze({ order: 'manual', unreadOnly: false, status: 'all', profile: 'all' })
+export const DEFAULT_VIEW = Object.freeze({ order: 'manual', unreadOnly: false, pinnedOnly: false, status: 'all', profile: 'all' })
 const VIEW_CHOICES = { order: ['manual', 'recent'], status: ['all', 'unread', 'working'], profile: ['all', 'current'] }
 
 export function normalizeView(v) {
   const src = v && typeof v === 'object' ? v : {}
   const pick = k => (VIEW_CHOICES[k].includes(src[k]) ? src[k] : DEFAULT_VIEW[k])
-  return { order: pick('order'), unreadOnly: src.unreadOnly === true, status: pick('status'), profile: pick('profile') }
+  return { order: pick('order'), unreadOnly: src.unreadOnly === true, pinnedOnly: src.pinnedOnly === true, status: pick('status'), profile: pick('profile') }
 }
 
 const empty = () => ({ folders: [], placed: {}, order: [], pinned: [], collapsed: {}, foldersOrdered: true, view: { ...DEFAULT_VIEW } })
@@ -259,8 +259,8 @@ export const ops = {
     delete placed[sid]
     return { ...t, placed, pinned, order: t.order.filter(x => x !== sid) }
   },
-  // Pinned chats are shown in an "Épinglées" section at the top (they also
-  // stay in their folder). Toggling keeps the user's pin order.
+  // Pinned = a subject in progress: a pin mark on the row, the chat stays where
+  // it is filed; the "Épinglées seulement" filter isolates them.
   togglePin(t, sid) {
     const cur = t.pinned || []
     return { ...t, pinned: cur.includes(sid) ? cur.filter(x => x !== sid) : [...cur, sid] }
@@ -383,7 +383,7 @@ const profileKey = p => String(p || '').trim() || 'default'
 // True when any filter narrows the rows. Ordering is not a filter.
 export const viewFilters = view => {
   const v = normalizeView(view)
-  return v.unreadOnly || v.status !== 'all' || v.profile !== 'all'
+  return v.unreadOnly || v.pinnedOnly || v.status !== 'all' || v.profile !== 'all'
 }
 
 export const viewIsDefault = view => {
@@ -414,8 +414,12 @@ export function narrowView(t, rows, query, view, currentProfile) {
   const byId = new Map(t.folders.map(f => [f.id, f]))
   const folders = new Set()
   const chats = new Set()
+  // Pinned = "sujet en cours": the mark stays on the chat where it is filed;
+  // this filter isolates them, keeping their folders.
+  const pinned = normalizeView(view).pinnedOnly ? new Set(t.pinned || []) : null
   for (const row of applyView(rows, view, currentProfile)) {
     if (textView && !textView.chats.has(row.id)) continue
+    if (pinned && !pinned.has(row.id)) continue
     chats.add(row.id)
     const fid = t.placed[row.id]
     if (fid && byId.has(fid)) ancestorsOf(byId, fid).forEach(f => folders.add(f.id))
@@ -496,7 +500,7 @@ export function chatMenuItems(row, { fid, flat, canUnpin, act }) {
     { label: 'Open in new tab', icon: 'split-horizontal', onSelect: () => act.open('tab') },
     { label: 'Open in new window', icon: 'link-external', onSelect: () => act.open('window') },
     '-',
-    { label: act.isPinned ? 'Désépingler' : 'Épingler en haut', icon: act.isPinned ? 'pinned' : 'pin', onSelect: act.togglePin },
+    { label: act.isPinned ? 'Désépingler' : 'Épingler', icon: act.isPinned ? 'pinned' : 'pin', onSelect: act.togglePin },
     { label: 'Rename', icon: 'edit', onSelect: act.rename },
     { label: 'Copy session ID', icon: 'copy', onSelect: act.copyId },
     '-',
@@ -510,14 +514,6 @@ export function chatMenuItems(row, { fid, flat, canUnpin, act }) {
       onSelect: () => act.place(f.id)
     })),
     '-',
-    // In the full build the backend PATCH is always available. In the
-    // catalog build expose SDK unpin only when this Desktop provides it.
-    {
-      label: canUnpin ? 'Unpin' : 'Unpin (update Desktop or use Sessions)',
-      icon: 'pinned',
-      disabled: !canUnpin,
-      onSelect: act.unpin
-    },
     { label: 'Archiver', icon: 'archive', onSelect: act.archive },
     '-',
     { label: 'Delete…', icon: 'trash', destructive: true, onSelect: act.del }
@@ -1708,8 +1704,8 @@ function PinnedPane() {
           ...(active ? { background: 'var(--ui-row-active-background)' } : null),
           ...(dropAt === 's:' + row.id ? { boxShadow: 'inset 0 2px 0 var(--theme-primary)' } : null)
         }),
-        title: (row.title || row.preview || row.id) + (canUnpin ? '\nShift-click to unpin' : ''),
-        onClick: e => !renaming && handlePinnedRowClick(e, { open: intent => openRow(row, intent), unpin }),
+        title: (row.title || row.preview || row.id) + '\nMaj+clic : épingler / désépingler',
+        onClick: e => !renaming && handlePinnedRowClick(e, { open: intent => openRow(row, intent), unpin: () => setTree(t => ops.togglePin(t, row.id)) }),
         onMouseDown: e => { if (e.button === 1) e.preventDefault() },
         onAuxClick: e => {
           if (e.button !== 1 || renaming) return
@@ -1961,31 +1957,13 @@ function PinnedPane() {
   const note = text =>
     jsx('div', { className: 'text-(--ui-text-tertiary)', style: { padding: '8px 10px', fontSize: '0.75rem' }, children: text }, 'note')
 
-  const byIdAll = new Map((rows || []).map(r => [r.id, r]))
-  const pinnedList = visibleRows((tree.pinned || []).map(id => byIdAll.get(id)).filter(Boolean), view)
-  const pinnedOpen = view ? true : !tree.collapsed.__pinned
-  const pinnedRows = !pinnedList.length ? [] : [
-    jsxs('div', {
-      className: 'hover:bg-(--ui-control-hover-background)',
-      style: rowStyle(0),
-      onClick: () => !view && setTree(t => ops.toggle(t, '__pinned')),
-      children: [
-        jsx(DisclosureCaret, { open: pinnedOpen, className: 'text-(--ui-text-tertiary)' }, 'caret'),
-        jsx(Codicon, { name: 'pinned', size: '0.875rem', className: 'text-(--ui-text-tertiary)' }, 'icon'),
-        jsx('span', { style: { flex: 1, fontWeight: 500 }, className: 'text-(--ui-text-secondary)', children: 'Épinglées' }, 'name'),
-        jsx('span', { className: 'text-(--ui-text-quaternary)', style: { fontSize: '0.6875rem', paddingRight: 24 }, children: pinnedList.length }, 'n')
-      ]
-    }, 'pinned-head'),
-    ...(pinnedOpen ? pinnedList.map(r => sessionRow(r, 1, 'pin:')) : [])
-  ]
-
   let body
   if (rows == null && !error) {
     body = [note('Loading pinned chats…')]
   } else if (rows == null) {
     body = [note('Could not load pinned chats: ' + error)]
   } else {
-    body = [...pinnedRows, ...(childFolders.get(ROOT) || []).flatMap(f => folderRow(f, 0)), ...unsortedRows]
+    body = [...(childFolders.get(ROOT) || []).flatMap(f => folderRow(f, 0)), ...unsortedRows]
     if (rows.length === 0) body.push(note('Aucune conversation pour l’instant.'))
     else if (view && !body.length) body.push(note(query.trim() ? 'Nothing matches “' + query.trim() + '”.' : 'No pinned chats match this view.'))
   }
@@ -1996,6 +1974,7 @@ function PinnedPane() {
     pick('Manual', viewOpts.order === 'manual', () => setView({ order: 'manual' })),
     pick('Most recent', viewOpts.order === 'recent', () => setView({ order: 'recent' })),
     '-',
+    pick('Épinglées seulement', viewOpts.pinnedOnly, () => setView({ pinnedOnly: !viewOpts.pinnedOnly })),
     pick('Unread only', viewOpts.unreadOnly, () => setView({ unreadOnly: !viewOpts.unreadOnly })),
     { header: 'Status' },
     pick('All', viewOpts.status === 'all', () => setView({ status: 'all' })),
@@ -2028,6 +2007,7 @@ function PinnedPane() {
               },
               'label'
             ),
+            jsx(IconButton, { icon: viewOpts.pinnedOnly ? 'pinned' : 'pin', title: viewOpts.pinnedOnly ? 'Tout afficher' : 'Seulement les conversations épinglées (sujets en cours)', onClick: () => setView({ pinnedOnly: !viewOpts.pinnedOnly }) }, 'pinonly'),
             jsx(IconButton, { icon: 'new-folder', title: 'New folder', onClick: () => newFolder(ROOT) }, 'new'),
             jsx(RowMenu, { items: filterItems, icon: narrowed ? 'filter-filled' : 'filter', label: narrowed ? 'Filter and order (filtered)' : 'Filter and order' }, 'filter'),
             jsx(RowMenu, { items: layoutItems, icon: 'kebab-vertical', label: 'More' }, 'more')
