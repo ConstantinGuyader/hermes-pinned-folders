@@ -480,7 +480,8 @@ const loaded = normalize(JSON.parse(JSON.stringify(legacy)))
 assert(JSON.stringify(loaded.view) === JSON.stringify(DEFAULT_VIEW), 'old layout without view state loads with default view')
 assert(loaded.pinned.length === 0, 'old layout loads with no pinned chats')
 assert(Array.isArray(loaded.closed) && loaded.closed.length === 0, 'old layout loads with no closed chats')
-assert(JSON.stringify({ ...loaded, view: undefined, pinned: undefined, closed: undefined }) === JSON.stringify({ ...legacy, view: undefined }), 'old layout keeps folders, colors, placement, order, collapse unchanged')
+assert(JSON.stringify(loaded.status) === '{}' && JSON.stringify(loaded.wait) === '{}' && JSON.stringify(loaded.titles) === '{}', 'old layout loads with no status, wait or titles (every chat En cours)')
+assert(JSON.stringify({ ...loaded, view: undefined, pinned: undefined, closed: undefined, status: undefined, wait: undefined, titles: undefined }) === JSON.stringify({ ...legacy, view: undefined }), 'old layout keeps folders, colors, placement, order, collapse unchanged')
 assert(JSON.stringify(normalizeView({ order: 'sideways', status: 42, unreadOnly: 'yes' })) === JSON.stringify(DEFAULT_VIEW), 'garbage view values fall back to defaults')
 // ── normalizeView edges: the persisted-view migration boundary. This function
 // rewrites user view state on every load, so "never break user state" applies to
@@ -621,7 +622,7 @@ if (FULL) {
     register: entry => registered.push(entry),
     onDispose: fn => { disposed.push(fn); return () => {} }
   })
-  assert(registered.map(e => e.id).join() === 'auto-pin,pane', 'register() registers the composer middleware and the pane')
+  assert(registered.map(e => e.id).join() === 'auto-pin,pane,grid-open', 'register() registers the composer middleware, the pane and the Grille palette command')
 
   // mutateTree: a new tree writes exactly once, at the connection-scoped key.
   const tk = 'tree.' + CONN
@@ -804,4 +805,93 @@ if (FULL) {
   const older = G.find(g => g.key === 'older')
   assert(shownInGroup(older, false).shown.length === 0 && shownInGroup(older, false).hidden === 2, 'Plus ancien starts folded')
   assert(shownInGroup(G[0], false).hidden === 0, 'Aujourd’hui is never cut')
+}
+
+// ── Grille (v0.8.0): status, wait, titles, grid model ──
+{
+  const { subjectRows } = mod
+  const { STATUSES, normalizeWait, openStatus, waitLate, waitShort, waitDetail, dayKey, gridModel, groupByStatus, GRID_ROWS, sharedPart, adoptServer } = mod
+  assert(STATUSES.join() === 'cours,veille,clos' && GRID_ROWS.map(r => r.key).join() === 'cours,veille,clos', 'three statuses: En cours, En veille, Clos (no « En attente »)')
+  // normalize: status / wait / titles kept, junk dropped, 'clos' moves to closed
+  const n = normalize({
+    folders: [], placed: {}, order: [], closed: ['z'], foldersOrdered: true,
+    status: { a: 'veille', b: 'cours', c: 'attente', d: 'clos', '': 'veille', e: 3 },
+    wait: { a: { who: ' David ', due: '2026-11-15' }, b: { who: 'AF', due: '15/11' }, c: { who: '' }, d: 'x', f: { who: 'Cristina' } },
+    titles: { z: 'Zed', y: 4 }
+  })
+  assert(JSON.stringify(n.status) === '{"a":"veille","b":"cours"}', 'normalize keeps cours/veille, drops unknown statuses')
+  assert(n.closed.join() === 'z,d', 'normalize: a stored « clos » status joins the closed list')
+  assert(JSON.stringify(n.wait) === '{"a":{"who":"David","due":"2026-11-15"},"b":{"who":"AF"},"f":{"who":"Cristina"}}', 'normalize keeps wait {who, due?}, drops bad dates and empty who')
+  assert(JSON.stringify(n.titles) === '{"z":"Zed"}', 'normalize keeps string titles only')
+  assert(normalizeWait({ who: 'x'.repeat(200) }).who.length === 80 && normalizeWait(null) === null, 'normalizeWait caps who, refuses junk')
+  const z = normalize({ folders: [], status: [], wait: 'x', titles: null })
+  assert(JSON.stringify([z.status, z.wait, z.titles]) === '[{},{},{}]', 'normalize: non-object status/wait/titles become {}')
+  // ops
+  let t = normalize({ folders: [{ id: 'f', name: 'Apoleos', parent: null }], placed: { a: 'f', b: 'f' }, order: [], foldersOrdered: true })
+  assert(openStatus(t, 'a') === 'cours', 'a chat without status is En cours')
+  t = ops.setStatus(t, 'a', 'veille')
+  assert(t.status.a === 'veille' && openStatus(t, 'a') === 'veille', 'setStatus veille')
+  assert(!('a' in ops.setStatus(t, 'a', 'cours').status), 'setStatus cours removes the entry (default)')
+  assert(ops.setStatus(t, 'a', 'attente') === t && ops.setStatus(t, '', 'veille') === t, 'setStatus refuses unknown status / empty id')
+  const c = ops.setStatus(t, 'a', 'clos')
+  assert(c.closed.join() === 'a' && !('a' in c.status) && c.placed.a === 'f', 'setStatus clos = closeSession: in closed, status cleared, folder kept')
+  const c2 = ops.closeSession(t, 'b', 'Titre B')
+  assert(c2.titles.b === 'Titre B' && c2.closed.includes('b'), 'closeSession keeps the title in the shared layout')
+  const r = ops.reopenSession(c2, 'b', 'veille')
+  assert(!r.closed.includes('b') && r.status.b === 'veille' && !('b' in r.titles), 'reopenSession(sid, status) reopens straight into that row, drops the title')
+  assert(ops.setStatus(c2, 'b', 'cours').closed.length === 0, 'setStatus cours on a closed chat takes it out of closed')
+  t = ops.setWait(t, 'a', 'David', '2026-11-15')
+  assert(JSON.stringify(t.wait.a) === '{"who":"David","due":"2026-11-15"}', 'setWait with a date')
+  assert(JSON.stringify(ops.setWait(t, 'b', 'AF').wait.b) === '{"who":"AF"}', 'setWait without a date (optional)')
+  assert(ops.setWait(t, 'b', '  ') === t, 'setWait refuses an empty who')
+  assert(!('a' in ops.clearWait(t, 'a').wait) && ops.clearWait(t, 'zz') === t, 'clearWait removes it; unknown id is a no-op')
+  assert(ops.setStatus(t, 'a', 'cours').wait.a.who === 'David', 'the wait mark survives a status change (it is not a status)')
+  const g = ops.forgetSession(ops.closeSession(t, 'a', 'A'), 'a')
+  assert(!('a' in g.status) && !('a' in g.wait) && !('a' in g.titles) && !g.closed.includes('a'), 'forgetSession (archive/delete) drops status, wait, title, closed')
+  // sync
+  const sp = sharedPart(t)
+  assert(sp.status.a === 'veille' && sp.wait.a.who === 'David' && typeof sp.titles === 'object', 'status, wait and titles are part of the synced layout')
+  const sp0 = sharedPart({ folders: [], placed: {}, order: [] })
+  assert(JSON.stringify([sp0.status, sp0.wait, sp0.titles]) === '[{},{},{}]', 'sharedPart defaults status/wait/titles to {}')
+  const ad = adoptServer(normalize({}), { folders: [], placed: {}, order: [], status: { q: 'veille' }, wait: { q: { who: 'AF' } } })
+  assert(ad.status.q === 'veille' && ad.wait.q.who === 'AF', 'adoptServer takes status and wait from the server')
+  const ex = JSON.parse(exportLayout(t))
+  assert(!('status' in ex) || ex.status, 'export unchanged by the new fields')
+  // wait pill
+  const now = new Date(2026, 10, 4, 18, 0).getTime()
+  assert(dayKey(now) === '2026-11-04', 'dayKey local date')
+  assert(waitLate({ who: 'x', due: '2026-11-03' }, now) && !waitLate({ who: 'x', due: '2026-11-04' }, now) && !waitLate({ who: 'x' }, now), 'pill turns red only once the date is past')
+  assert(waitShort('David') === 'David' && waitShort('Stéphane et David') === 'SD' && waitShort('Bureau Veritas') === 'BV', 'pill text: first name or initials')
+  assert(waitShort('Fayat (Grégory Jacquet)') === 'Fayat' && waitShort("l'autre partie") === 'AP' && waitShort('TotalEnergies (Fabrice, Clothilde)') === 'TE', 'pill text drops the parenthesis, short words')
+  assert(waitDetail({ who: 'David', due: '2026-11-15' }, now) === 'En attente chez David · pour le 15 novembre', 'hover: chez qui, pour quand')
+  assert(waitDetail({ who: 'David', due: '2026-11-03' }, now).includes('date passée') && waitDetail({ who: 'AF' }, now) === 'En attente chez AF', 'hover: late / no date')
+  // grid model
+  const T = normalize({
+    folders: [{ id: 'ap', name: 'Apoleos', parent: null, generalSession: 'g' }, { id: 'apd', name: 'Direction', parent: 'ap' }, { id: 'te', name: 'Tendr', parent: null }, { id: 'pa', name: 'Panorama', parent: null }],
+    placed: { a: 'apd', b: 'ap', x: 'apd', t1: 'te' }, order: [], closed: ['x', 'b2'], foldersOrdered: true,
+    status: { b: 'veille', t1: 'veille' }, wait: { a: { who: 'David', due: '2026-11-03' } }, titles: { x: 'Old X' }
+  })
+  const rowsG = [
+    { id: 'a', title: 'A', last_active: 5 }, { id: 'b', title: 'B', last_active: 4 }, { id: 'g', title: 'Apoleos – Général', last_active: 3 },
+    { id: 't1', title: 'T1', last_active: 2 }, { id: 'u', title: 'Unfiled', last_active: 1 }, { id: 'arch', title: 'Arch', archived: true }
+  ]
+  const M = gridModel(T, rowsG, { b2: { title: 'Legacy closed' } })
+  assert(M.map(c => c.id).join() === 'ap,te,pa,__unsorted', 'columns = root folders (grid order), « À ranger » last when used')
+  const AP = M[0]
+  assert(AP.cells.cours.map(x => x.id).join() === 'a,g' && AP.cells.veille.map(x => x.id).join() === 'b', 'rows by status; General chats are cards like the others')
+  assert(AP.cells.clos.map(x => x.title).join() === 'Old X', 'Clos row: closed chats with their stored title')
+  assert(AP.cells.cours[0].wait.who === 'David' && AP.color === '#6E78E6', 'card carries its wait mark and the company color')
+  assert(M[1].cells.veille.length === 1 && !M[1].empty, 'Tendr: one chat in veille')
+  assert(M[2].empty && M[2].id === 'pa', 'a company with no open chat is an empty (narrow) column')
+  assert(M[3].cells.cours.map(x => x.id).join() === 'u' && M[3].cells.clos.map(x => x.title).join() === 'Legacy closed', 'unfiled chats and unplaced closed ones go to « À ranger »; legacy local titles still used')
+  assert(!M.some(c => [...c.cells.cours, ...c.cells.veille].some(x => x.id === 'arch')), 'archived chats are not cards')
+  const M2 = gridModel(normalize({ ...T, closed: ['a'] }), rowsG)
+  assert(M2[0].cells.cours.some(x => x.id === 'a') && !M2[0].cells.clos.some(x => x.id === 'a'), 'a closed chat un-archived elsewhere is back as an open card')
+  assert(!gridModel(normalize({ folders: [{ id: 'ap', name: 'Apoleos', parent: null }], placed: { a: 'ap' }, foldersOrdered: true }), [{ id: 'a', title: 'A' }]).some(c => c.id === '__unsorted'), '« À ranger » column hidden when empty')
+  const ord = gridModel(normalize({ folders: ['Tendr', 'GEEIS+', 'Zeta', 'Apoleos', 'Panorama', 'Perso', 'GUYADER SI Consulting'].map((name, i) => ({ id: 'r' + i, name, parent: null })), foldersOrdered: true }), [])
+  assert(ord.map(c => c.name).join() === 'Apoleos,GEEIS+,Tendr,Perso,GUYADER SI Consulting,Panorama,Zeta', 'grid columns: Apoleos, GEEIS+, Tendr, Perso, GUYADER SI, Panorama, then the others')
+  // sidebar grouped by status (a company folded out of the grid)
+  const S = subjectRows(T, rowsG)
+  const GS = groupByStatus(T, S)
+  assert(GS.map(x => x.label).join() === 'En cours,En veille' && GS[1].rows.map(s => s.id).join() === 'b,t1', 'groupByStatus: En cours then En veille, no Clos group')
 }

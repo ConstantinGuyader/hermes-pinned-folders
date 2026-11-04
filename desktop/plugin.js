@@ -55,7 +55,7 @@ import {
   SidebarRowLead,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ROOT = null // "À classer": a chat with no folder
@@ -84,7 +84,41 @@ export function normalizeView(v) {
   return { order: pick('order'), unreadOnly: src.unreadOnly === true, pinnedOnly: src.pinnedOnly === true, status: pick('status'), profile: pick('profile') }
 }
 
-const empty = () => ({ folders: [], placed: {}, order: [], pinned: [], closed: [], collapsed: {}, foldersOrdered: true, view: { ...DEFAULT_VIEW } })
+const empty = () => ({ folders: [], placed: {}, order: [], pinned: [], closed: [], status: {}, wait: {}, titles: {}, collapsed: {}, foldersOrdered: true, view: { ...DEFAULT_VIEW } })
+
+// ── Grille (v0.8.0): status and wait mark per chat ──
+// status: { sessionId: 'cours' | 'veille' } (absent = En cours). Clos is the
+// `closed` list (chat archived), so a stored 'clos' moves there on load.
+// wait: { sessionId: { who, due? } }, due = 'YYYY-MM-DD'. titles: titles of
+// closed chats (archived chats are no longer listed).
+export const STATUSES = ['cours', 'veille', 'clos']
+const DUE_RE = /^\d{4}-\d{2}-\d{2}$/
+const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v)
+
+export function normalizeWait(w) {
+  if (!isObj(w) || typeof w.who !== 'string' || !w.who.trim()) return null
+  const out = { who: w.who.trim().slice(0, 80) }
+  if (typeof w.due === 'string' && DUE_RE.test(w.due)) out.due = w.due
+  return out
+}
+
+function normalizeMarks(v, closedIn) {
+  const closed = [...closedIn]
+  const status = {}
+  for (const [k, s] of Object.entries(isObj(v.status) ? v.status : {})) {
+    if (!k) continue
+    if (s === 'cours' || s === 'veille') status[k] = s
+    else if (s === 'clos' && !closed.includes(k)) closed.push(k)
+  }
+  const wait = {}
+  for (const [k, w] of Object.entries(isObj(v.wait) ? v.wait : {})) {
+    const n = normalizeWait(w)
+    if (k && n) wait[k] = n
+  }
+  const titles = {}
+  for (const [k, s] of Object.entries(isObj(v.titles) ? v.titles : {})) if (k && typeof s === 'string') titles[k] = s.slice(0, 200)
+  return { closed, status, wait, titles }
+}
 
 // Folder order is the user's (array order). Layouts saved before manual
 // ordering existed were shown alphabetically, so sort them once on load.
@@ -94,13 +128,17 @@ export function normalize(v) {
   if (!v || typeof v !== 'object') return empty()
   let folders = Array.isArray(v.folders) ? v.folders.filter(f => f && typeof f.id === 'string' && typeof f.name === 'string') : []
   if (v.foldersOrdered !== true) folders = [...folders].sort(byName)
+  // Sujets view: chats closed with « Clore » (archived, listed under Clos).
+  const marks = normalizeMarks(v, Array.isArray(v.closed) ? [...new Set(v.closed.filter(x => typeof x === 'string' && x))] : [])
   return {
     folders,
     placed: v.placed && typeof v.placed === 'object' ? v.placed : {},
     order: Array.isArray(v.order) ? v.order : [],
     pinned: Array.isArray(v.pinned) ? v.pinned.filter(x => typeof x === 'string') : [],
-    // Sujets view: chats closed with « Clore » (archived, listed under Clos).
-    closed: Array.isArray(v.closed) ? [...new Set(v.closed.filter(x => typeof x === 'string' && x))] : [],
+    closed: marks.closed,
+    status: marks.status,
+    wait: marks.wait,
+    titles: marks.titles,
     collapsed: v.collapsed && typeof v.collapsed === 'object' ? v.collapsed : {},
     foldersOrdered: true,
     view: normalizeView(v.view)
@@ -260,22 +298,60 @@ export const ops = {
     t = clearGeneralElsewhere(t, sid, undefined)
     const pinned = (t.pinned || []).filter(x => x !== sid)
     const closed = (t.closed || []).filter(x => x !== sid)
-    if (!(sid in t.placed) && !t.order.includes(sid) && pinned.length === (t.pinned || []).length && closed.length === (t.closed || []).length) return t
+    const marked = !!(t.status && sid in t.status) || !!(t.wait && sid in t.wait) || !!(t.titles && sid in t.titles)
+    if (!(sid in t.placed) && !t.order.includes(sid) && pinned.length === (t.pinned || []).length && closed.length === (t.closed || []).length && !marked) return t
     const placed = { ...t.placed }
     delete placed[sid]
-    return { ...t, placed, pinned, closed, order: t.order.filter(x => x !== sid) }
+    const status = { ...(t.status || {}) }
+    const wait = { ...(t.wait || {}) }
+    const titles = { ...(t.titles || {}) }
+    delete status[sid]
+    delete wait[sid]
+    delete titles[sid]
+    return { ...t, placed, pinned, closed, status, wait, titles, order: t.order.filter(x => x !== sid) }
   },
   // Clore (Sujets view): the chat is archived by the caller and noted here; it
-  // keeps its folder and pin, so Rouvrir puts it back where it was.
-  closeSession(t, sid) {
+  // keeps its folder and pin, so Rouvrir puts it back where it was. The title
+  // is kept in the shared layout (an archived chat is not listed any more).
+  closeSession(t, sid, title) {
     if (!sid) return t
     const cur = t.closed || []
-    return { ...t, closed: [...cur.filter(x => x !== sid), sid] }
+    const status = { ...(t.status || {}) }
+    delete status[sid]
+    const titles = typeof title === 'string' && title ? { ...(t.titles || {}), [sid]: title.slice(0, 200) } : t.titles || {}
+    return { ...t, closed: [...cur.filter(x => x !== sid), sid], status, titles }
   },
-  reopenSession(t, sid) {
+  reopenSession(t, sid, status) {
     const cur = t.closed || []
-    if (!cur.includes(sid)) return t
-    return { ...t, closed: cur.filter(x => x !== sid) }
+    if (!cur.includes(sid) && !status) return t
+    const titles = { ...(t.titles || {}) }
+    delete titles[sid]
+    const out = { ...t, closed: cur.filter(x => x !== sid), titles }
+    return status ? ops.setStatus(out, sid, status) : out
+  },
+  // Grille: En cours / En veille. 'clos' goes through closeSession (the caller
+  // archives the chat). En cours is the default, so it is not stored.
+  setStatus(t, sid, status) {
+    if (!sid) return t
+    if (status === 'clos') return ops.closeSession(t, sid)
+    if (status !== 'cours' && status !== 'veille') return t
+    const next = { ...(t.status || {}) }
+    if (status === 'cours') delete next[sid]
+    else next[sid] = status
+    const closed = (t.closed || []).filter(x => x !== sid)
+    return { ...t, status: next, closed }
+  },
+  // Attente: who has the ball (free text) and an optional due date.
+  setWait(t, sid, who, due) {
+    const w = normalizeWait({ who, due })
+    if (!sid || !w) return t
+    return { ...t, wait: { ...(t.wait || {}), [sid]: w } }
+  },
+  clearWait(t, sid) {
+    if (!t.wait || !(sid in t.wait)) return t
+    const wait = { ...t.wait }
+    delete wait[sid]
+    return { ...t, wait }
   },
   // Pinned = a subject in progress: a pin mark on the row, the chat stays where
   // it is filed; the "Épinglées seulement" filter isolates them.
@@ -722,6 +798,109 @@ export function closedList(t, liveIds) {
   return [...(t.closed || [])].filter(id => !live.has(id)).reverse()
 }
 
+// ── Grille (v0.8.0): pure helpers, exported for tests ───────────────────────
+// Columns = companies (root folders, layout order), rows = En cours / En veille
+// / Clos. One card = one chat. A chat with no status is En cours; Clos = the
+// `closed` list (archived). A live chat still listed in `closed` (un-archived
+// elsewhere) is back in the list, so it shows as open.
+export const GRID_ROWS = [
+  { key: 'cours', label: 'En cours' },
+  { key: 'veille', label: 'En veille' },
+  { key: 'clos', label: 'Clos' }
+]
+
+export const openStatus = (t, sid) => (t.status && t.status[sid] === 'veille' ? 'veille' : 'cours')
+
+const pad2 = n => String(n).padStart(2, '0')
+export function dayKey(ms) {
+  const d = new Date(ms)
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate())
+}
+
+// The wait mark turns red once its date is past (the day itself is not late).
+export const waitLate = (w, now) => !!(w && w.due && w.due < dayKey(now))
+
+// Pill text: a first name or initials. « David » -> David, « Stéphane et
+// David » -> SD, « Bureau Veritas » -> BV, « Fayat (Grégory Jacquet) » -> Fayat.
+export function waitShort(who) {
+  const base = String(who || '').replace(/\([^)]*\)/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!base) return ''
+  const initial = s => (s.replace(/^[^A-Za-zÀ-ÿ0-9]+/, '')[0] || '').toUpperCase()
+  const parts = base.split(/\s*(?:,|&|\+|\bet\b)\s*/i).filter(Boolean)
+  if (parts.length > 1) return parts.map(p => initial(p)).join('').slice(0, 3)
+  const words = base.split(' ').map(w => w.replace(/^(l|d)['’]/i, '')).filter(w => w && !/^(de|du|des|la|le|les)$/i.test(w))
+  if (words.length === 1) {
+    const w = words[0]
+    const cap = w[0] ? w[0].toUpperCase() + w.slice(1) : w
+    if (cap.length <= 12) return cap
+    return (cap.match(/[A-ZÀ-Ý]/g) || [cap[0]]).join('').slice(0, 3)
+  }
+  return words.map(initial).join('').slice(0, 3)
+}
+
+export function dueLabel(due) {
+  if (!due) return ''
+  const [y, m, d] = due.split('-').map(Number)
+  return new Date(y, m - 1, d).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long' })
+}
+
+// Hover text of the pill (the only place the detail shows).
+export function waitDetail(w, now) {
+  if (!w) return ''
+  const who = 'En attente chez ' + w.who
+  if (!w.due) return who
+  return who + (waitLate(w, now) ? ' · date passée : ' : ' · pour le ') + dueLabel(w.due)
+}
+
+// Column order of the grid (slugs of root folder names); unknown companies
+// follow in layout order.
+export const GRID_ORDER = ['apoleos', 'geeis', 'tendr', 'perso', 'guyader-si-consulting', 'panorama']
+const gridRank = f => {
+  const i = GRID_ORDER.indexOf(slugify(f.name))
+  return i < 0 ? GRID_ORDER.length : i
+}
+
+export function gridModel(t, rows, extraTitles = {}) {
+  const folders = t.folders || []
+  const byId = new Map(folders.map(f => [f.id, f]))
+  const roots = folders
+    .filter(f => !f.parent || !byId.has(f.parent))
+    .map((f, i) => ({ f, i }))
+    .sort((a, b) => gridRank(a.f) - gridRank(b.f) || a.i - b.i)
+    .map(x => x.f)
+  const mk = (id, org, name) => ({ id, org, name, color: org ? orgColor(org) : null, cells: { cours: [], veille: [], clos: [] }, empty: true })
+  const cols = roots.map(f => mk(f.id, f, f.name))
+  const colOf = new Map(cols.map(c => [c.id, c]))
+  const unsorted = mk('__unsorted', null, 'À ranger')
+  const wait = t.wait || {}
+  const live = new Set()
+  for (const s of subjectRows(t, rows)) {
+    live.add(s.id)
+    const col = (s.orgId && colOf.get(s.orgId)) || unsorted
+    const status = openStatus(t, s.id)
+    col.cells[status].push({ id: s.id, title: subjectTitle(s), row: s.row, status, wait: wait[s.id] || null, general: s.general, colId: col.id })
+  }
+  for (const id of closedList(t, live)) {
+    const fid = t.placed?.[id]
+    const chain = fid && byId.has(fid) ? ancestorsOf(byId, fid) : []
+    const org = chain.length ? chain[chain.length - 1] : null
+    const col = (org && colOf.get(org.id)) || unsorted
+    const meta = extraTitles[id] || {}
+    col.cells.clos.push({ id, title: (t.titles && t.titles[id]) || meta.title || 'Conversation close', row: null, profile: meta.profile || null, status: 'clos', wait: null, closed: true, colId: col.id })
+  }
+  const all = [...cols, unsorted]
+  for (const c of all) c.empty = !c.cells.cours.length && !c.cells.veille.length
+  // « À ranger » only shows when it holds something.
+  return all.filter(c => c !== unsorted || c.cells.cours.length || c.cells.veille.length || c.cells.clos.length)
+}
+
+// Sidebar list grouped by status (a company folded out of the grid).
+export function groupByStatus(t, list) {
+  const by = { cours: [], veille: [] }
+  for (const s of list || []) by[openStatus(t, s.id)].push(s)
+  return GRID_ROWS.filter(g => g.key !== 'clos' && by[g.key].length).map(g => ({ key: g.key, label: g.label, limit: Infinity, rows: by[g.key] }))
+}
+
 // ── pinned rows: the backend's own pinned flag, all profiles ─────────────────
 // limit=0 + include_pinned back-fill = exactly the pinned rows, nothing else.
 
@@ -786,7 +965,7 @@ const SYNC_MS = 4000
 const PUSH_DELAY_MS = 400
 
 export function sharedPart(t) {
-  return { folders: t.folders, placed: t.placed, order: t.order, pinned: t.pinned || [], closed: t.closed || [], foldersOrdered: true }
+  return { folders: t.folders, placed: t.placed, order: t.order, pinned: t.pinned || [], closed: t.closed || [], status: t.status || {}, wait: t.wait || {}, titles: t.titles || {}, foldersOrdered: true }
 }
 
 // Server layout + this app's local-only fields -> the tree to show.
@@ -848,9 +1027,13 @@ async function pullNow(key, force = false) {
   emit({ type: 'tree', key, tree: next })
 }
 
-function useServerSync(key) {
-  useEffect(() => {
-    if (!rest) return
+const syncUsers = new Map() // key -> { n, stop }: the sidebar and the Grille tab share one loop
+
+function acquireSync(key) {
+  const cur = syncUsers.get(key)
+  if (cur) {
+    cur.n++
+  } else {
     sync.key = key
     sync.rev = null
     sync.dirty = false
@@ -862,11 +1045,22 @@ function useServerSync(key) {
       if (alive && sync.available !== false) timer = setTimeout(tick, SYNC_MS)
     }
     tick()
-    return () => {
-      alive = false
-      clearTimeout(timer)
-      if (sync.key === key) sync.key = null
-    }
+    syncUsers.set(key, { n: 1, stop: () => { alive = false; clearTimeout(timer) } })
+  }
+  return () => {
+    const u = syncUsers.get(key)
+    if (!u) return
+    if (--u.n > 0) return
+    u.stop()
+    syncUsers.delete(key)
+    if (sync.key === key) sync.key = null
+  }
+}
+
+function useServerSync(key) {
+  useEffect(() => {
+    if (!rest) return
+    return acquireSync(key)
   }, [key])
 }
 
@@ -1531,6 +1725,7 @@ function FilesPane({ candidates }) {
 
 const NAV = [
   { icon: 'edit', label: 'Nouvelle session', run: () => host.newChat?.() },
+  { icon: 'project', label: 'Grille des conversations', run: () => openGrid() },
   { icon: 'extensions', label: 'Capacités', run: () => host.navigate('/capabilities') },
   { icon: 'comment-discussion', label: 'Messagerie', run: () => host.navigate('/messaging') },
   { icon: 'files', label: 'Artefacts', run: () => host.navigate('/artifacts') },
@@ -2225,6 +2420,365 @@ function PinnedPane({ onSwitch } = {}) {
   })
 }
 
+// ── Grille (v0.8.0) ──────────────────────────────────────────────────────────
+// A main-area tab (host.openWorkspace): companies in columns, statuses in rows,
+// one card per chat. Click opens, right-click sets status / wait / archive,
+// dragging a card to another row changes its status. Clicking a company header
+// closes the grid and shows that company in the sidebar, grouped by status.
+
+const GRID_ID = 'pinned-folders:grid'
+const SIDEBAR_PANE_ID = 'pinned-folders:pane'
+let gridClose = null
+
+export function openGrid() {
+  if (typeof host.openWorkspace !== 'function') return host.notifyError(new Error('openWorkspace unavailable'), 'Cette version de Hermes ne sait pas ouvrir la grille')
+  try {
+    gridClose = host.openWorkspace(GRID_ID, {
+      title: 'Grille',
+      minWidth: '36rem',
+      render: () => jsx(GridPane, {}),
+      onClose: () => { gridClose = null }
+    })
+  } catch (err) {
+    host.notifyError(err, 'Impossible d’ouvrir la grille')
+  }
+}
+
+function closeGrid() {
+  const close = gridClose
+  gridClose = null
+  try { close?.() } catch (err) { console.error('[pinned-folders] close grid', err) }
+}
+
+// Fold a company out of the grid: the sidebar shows it alone, grouped by status.
+function foldToSidebar(orgId) {
+  const before = store.get('subjectsOrgs', [])
+  if (store.get('subjectsGroup', 'date') !== 'status') store.set('subjectsOrgsBefore', before)
+  store.set('subjectsOrgs', [orgId])
+  store.set('subjectsGroup', 'status')
+  store.set('mode', 'sujets')
+  emit({ type: 'subjects-focus', orgs: [orgId], group: 'status' })
+  try { host.revealPane?.(SIDEBAR_PANE_ID) } catch {}
+  setTimeout(closeGrid, 0)
+}
+
+const GRID_CSS = `
+[data-pf-grid]{height:100%;width:100%;min-width:0;contain:inline-size;min-height:0;display:flex;flex-direction:column;background:var(--ui-chat-surface-background, var(--background));color:var(--foreground, inherit)}
+[data-pf-grid] .pfg-head{display:flex;align-items:baseline;gap:12px;padding:16px 20px 12px;flex-shrink:0}
+[data-pf-grid] .pfg-title{font-size:1rem;font-weight:600;letter-spacing:-.01em}
+[data-pf-grid] .pfg-meta{font-size:0.75rem;color:var(--ui-text-tertiary)}
+[data-pf-grid] .pfg-hint{margin-left:auto;font-size:0.6875rem;color:var(--ui-text-quaternary, var(--ui-text-tertiary))}
+[data-pf-grid] .pfg-scroll{flex:1;min-height:0;min-width:0;overflow:auto;padding:0 20px 20px}
+[data-pf-grid] .pfg-grid{display:grid;gap:8px;align-items:stretch}
+[data-pf-grid] .pfg-colh{position:sticky;top:0;z-index:3;display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;border-radius:8px;cursor:pointer;user-select:none;font-size:0.8125rem;font-weight:600;background:linear-gradient(var(--ui-chat-surface-background, transparent), var(--ui-chat-surface-background, transparent)), var(--ui-base, var(--background, #0b0d12));box-shadow:inset 0 3px 0 var(--c), 0 6px 8px -6px rgba(0,0,0,.5)}
+[data-pf-grid] .pfg-colh:hover{color:var(--theme-primary)}
+[data-pf-grid] .pfg-colh .pfg-n{margin-left:auto;font-weight:500;font-size:0.6875rem;color:var(--ui-text-tertiary)}
+[data-pf-grid] .pfg-colh.pfg-band{justify-content:center;padding:0;font-size:0.625rem;color:var(--ui-text-tertiary)}
+[data-pf-grid] .pfg-corner{position:sticky;top:0;z-index:3;background:linear-gradient(var(--ui-chat-surface-background, transparent), var(--ui-chat-surface-background, transparent)), var(--ui-base, var(--background, #0b0d12))}
+[data-pf-grid] .pfg-rowh{display:flex;flex-direction:column;gap:2px;padding:10px 2px 0;font-size:0.6875rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--ui-text-tertiary);user-select:none}
+[data-pf-grid] .pfg-rowh .pfg-n{font-weight:500;letter-spacing:0;text-transform:none;color:var(--ui-text-quaternary, var(--ui-text-tertiary))}
+[data-pf-grid] .pfg-rowh.pfg-fold{cursor:pointer}
+[data-pf-grid] .pfg-rowh.pfg-fold:hover{color:var(--foreground, inherit)}
+[data-pf-grid] .pfg-cell{display:flex;flex-direction:column;gap:6px;padding:6px;border-radius:10px;background:var(--ui-bg-tertiary, rgba(127,127,127,.07));min-height:76px;box-sizing:border-box}
+[data-pf-grid] .pfg-cell.pfg-band{background:repeating-linear-gradient(135deg, transparent 0 6px, rgba(127,127,127,.06) 6px 12px)}
+[data-pf-grid] .pfg-cell.pfg-over{box-shadow:inset 0 0 0 2px var(--theme-primary);background:color-mix(in srgb, var(--theme-primary) 10%, transparent)}
+[data-pf-grid] .pfg-cell.pfg-thin{min-height:34px;justify-content:center;align-items:center;font-size:0.6875rem;color:var(--ui-text-quaternary, var(--ui-text-tertiary));cursor:pointer}
+[data-pf-grid] .pfg-card{position:relative;box-sizing:border-box;height:var(--pfg-h, auto);flex-shrink:0;padding:8px 9px 8px 12px;border-radius:7px;background:var(--ui-bg-elevated, var(--background));border:1px solid var(--ui-stroke-tertiary);box-shadow:inset 3px 0 0 var(--c);font-size:0.78125rem;line-height:1.32;cursor:pointer;user-select:none;overflow:hidden;overflow-wrap:break-word;hyphens:auto}
+[data-pf-grid] .pfg-card:hover{border-color:var(--ui-stroke-secondary);background:var(--ui-row-hover-background, var(--ui-control-hover-background))}
+[data-pf-grid] .pfg-card.pfg-closed{opacity:.62}
+[data-pf-grid] .pfg-card.pfg-dragging{opacity:.35}
+[data-pf-grid] .pfg-card.pfg-hasw{overflow:visible}
+[data-pf-grid] .pfg-wait{float:right;position:relative;display:inline-flex;align-items:center;gap:3px;height:19px;margin:-2px -3px 2px 6px;padding:0 7px 0 5px;border-radius:10px;background:var(--theme-primary);color:var(--primary-foreground, #fff);font-size:0.6875rem;font-weight:700;line-height:19px;white-space:nowrap}
+[data-pf-grid] .pfg-wait.pfg-late{background:var(--ui-red, #E5484D);color:#fff}
+[data-pf-grid] .pfg-tip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:30;white-space:nowrap;padding:6px 10px;border-radius:7px;background:var(--ui-bg-elevated, var(--background));border:1px solid var(--ui-stroke-secondary);box-shadow:0 8px 24px rgba(0,0,0,.28);color:var(--foreground, inherit);font-weight:500;font-size:0.75rem;line-height:1.4}
+[data-pf-grid] .pfg-wait:hover .pfg-tip{display:block}
+[data-pf-grid] .pfg-in{display:flow-root}
+`
+
+// Card height: one value for the whole grid, measured from the tallest title
+// at the current column width (cards never clip text), at least two lines.
+const CARD_PAD = 18 // 8 + 8 padding + 2 border
+const CARD_MIN_LINES = 2
+
+function WaitDialog({ card, onClose, onSubmit }) {
+  const [who, setWho] = useState('')
+  const [due, setDue] = useState('')
+  useEffect(() => {
+    if (card) {
+      setWho(card.wait?.who || '')
+      setDue(card.wait?.due || '')
+    }
+  }, [card])
+  const submit = () => {
+    if (who.trim()) onSubmit(who.trim(), due || undefined)
+  }
+  const keys = e => {
+    e.stopPropagation()
+    if (e.key === 'Enter') submit()
+  }
+  return jsx(Dialog, {
+    open: !!card,
+    onOpenChange: o => !o && onClose(),
+    children: jsxs(DialogContent, {
+      children: [
+        jsxs(DialogHeader, { children: [jsx(DialogTitle, { children: 'En attente' }, 't'), jsx(DialogDescription, { children: card ? card.title : '' }, 'd')] }, 'h'),
+        jsxs('label', { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: '0.75rem' }, children: [jsx('span', { children: 'Chez qui (prénom ou initiales)' }, 'l'), jsx(Input, { value: who, autoFocus: true, placeholder: 'David', onChange: e => setWho(e.target.value), onKeyDown: keys }, 'i')] }, 'w'),
+        jsxs('label', { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: '0.75rem' }, children: [jsx('span', { children: 'Pour quand (facultatif)' }, 'l'), jsx(Input, { type: 'date', value: due, onChange: e => setDue(e.target.value), onKeyDown: keys }, 'i')] }, 'd'),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { variant: 'ghost', onClick: onClose, children: 'Annuler' }, 'c'),
+            jsx(Button, { disabled: !who.trim(), onClick: submit, children: 'Enregistrer' }, 'ok')
+          ]
+        }, 'f')
+      ]
+    })
+  })
+}
+
+function GridPane() {
+  const connectionId = useValue(host.state.connectionId)
+  const key = treeKey(connectionId)
+  const [tree, setTreeRaw] = useState(() => loadTree(key))
+  useEffect(() => {
+    setTreeRaw(loadTree(key))
+    return onBus(ev => ev.type === 'tree' && ev.key === key && setTreeRaw(ev.tree))
+  }, [key])
+  const setTree = fn => mutateTree(key, fn)
+  useServerSync(key)
+  const { rows, error, dropRow, refresh: refreshRows } = usePinnedRows(key)
+  useEffect(() => onBus(ev => ev.type === 'rows' && refreshRows()), [key])
+  const [showClosed, setShowClosedRaw] = useState(() => store.get('gridClosedOpen', false) === true)
+  const setShowClosed = v => { setShowClosedRaw(v); store.set('gridClosedOpen', v) }
+  const [waitCard, setWaitCard] = useState(null)
+  const [drag, setDrag] = useState(null) // { card, over }
+  const scrollRef = useRef(null)
+  const titleEls = useRef(new Map())
+  const [cardH, setCardH] = useState(0)
+  const [width, setWidth] = useState(0)
+  const now = Date.now()
+
+  const legacyTitles = store.get(CLOSED_TITLES_KEY, {})
+  const cols = useMemo(() => gridModel(tree, rows || [], legacyTitles), [tree, rows])
+  const open = cols.reduce((n, c) => n + c.cells.cours.length + c.cells.veille.length, 0)
+  const waiting = cols.reduce((n, c) => n + [...c.cells.cours, ...c.cells.veille].filter(x => x.wait).length, 0)
+  const closedN = cols.reduce((n, c) => n + c.cells.clos.length, 0)
+
+  const setArchived = (id, profile, archived) => rest('/archive', { method: 'POST', body: { session_id: id, archived, ...(profile ? { profile } : {}) } })
+  const profileOf = card => (card.row && card.row.profile) || card.profile || null
+
+  const setStatus = (card, status) => {
+    if (status === card.status) return
+    if (!rest && (status === 'clos' || card.closed)) return host.notifyError(new Error('No backend connection'), 'Impossible de changer le statut')
+    if (status === 'clos') {
+      dropRow(card.id)
+      setTree(t => ops.closeSession(t, card.id, card.title))
+      setArchived(card.id, profileOf(card), true).catch(err => {
+        host.notifyError(err, 'Impossible de clore')
+        setTree(t => ops.reopenSession(t, card.id, card.status))
+        refreshRows()
+      })
+      return
+    }
+    if (card.closed) {
+      setTree(t => ops.reopenSession(t, card.id, status))
+      setArchived(card.id, profileOf(card), false)
+        .then(() => refreshRows())
+        .catch(err => {
+          host.notifyError(err, 'Impossible de rouvrir')
+          setTree(t => ops.closeSession(t, card.id, card.title))
+        })
+      return
+    }
+    setTree(t => ops.setStatus(t, card.id, status))
+  }
+
+  const archive = card => {
+    if (card.closed) return setTree(t => ops.forgetSession(t, card.id))
+    if (!rest) return host.notifyError(new Error('No backend connection'), 'Impossible d’archiver')
+    dropRow(card.id)
+    setTree(t => ops.forgetSession(t, card.id))
+    setArchived(card.id, profileOf(card), true)
+      .then(() => host.notify({ kind: 'success', message: '« ' + card.title + ' » archivée', durationMs: 2500 }))
+      .catch(err => {
+        host.notifyError(err, 'Impossible d’archiver')
+        refreshRows()
+      })
+  }
+
+  const openCard = (card, intent) =>
+    host
+      .openSession(card.id, { profile: profileOf(card) || undefined, ...(intent ? { intent } : {}) })
+      .catch(err => host.notifyError(err, 'Impossible d’ouvrir cette conversation'))
+
+  const menuFor = card => [
+    { header: 'Statut' },
+    ...GRID_ROWS.map(r => ({ label: r.label, icon: card.status === r.key ? 'check' : 'blank', disabled: card.status === r.key, onSelect: () => setStatus(card, r.key) })),
+    '-',
+    card.closed ? null : { label: card.wait ? 'Modifier l’attente…' : 'Mettre en attente…', icon: 'debug-pause', onSelect: () => setWaitCard(card) },
+    card.wait ? { label: 'Retirer l’attente', icon: 'debug-continue', onSelect: () => setTree(t => ops.clearWait(t, card.id)) } : null,
+    card.closed ? null : '-',
+    { label: 'Archiver', icon: 'archive', destructive: true, onSelect: () => archive(card) }
+  ]
+
+  // Native drag-and-drop (same mechanism as the Dossiers view): a card dropped
+  // on another row of its own column changes status.
+  const dropTarget = (row, colId) => (drag && drag.card.colId === colId && row !== drag.card.status ? row : null)
+  const cellDnd = (row, colId) => ({
+    onDragOver: e => {
+      if (!drag || dropTarget(row, colId) == null) return
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'move'
+      if (drag.over !== row) setDrag(d => (d ? { ...d, over: row } : d))
+    },
+    onDragLeave: () => drag && drag.over === row && setDrag(d => (d ? { ...d, over: null } : d)),
+    onDrop: e => {
+      e.preventDefault()
+      const card = drag && drag.card
+      setDrag(null)
+      if (card && dropTarget(row, colId) != null) setStatus(card, row)
+    }
+  })
+
+  const pill = card =>
+    card.wait
+      ? jsxs('span', {
+          className: 'pfg-wait' + (waitLate(card.wait, now) ? ' pfg-late' : ''),
+          'data-pfg-wait': card.id,
+          children: [
+            jsx(Codicon, { name: 'debug-pause', size: '0.6875rem' }, 'i'),
+            jsx('span', { children: waitShort(card.wait.who) }, 'w'),
+            jsx('span', { className: 'pfg-tip', children: waitDetail(card.wait, now) }, 'tip')
+          ]
+        }, 'pill')
+      : null
+
+  const cardEl = (card, color) => {
+    const el = jsxs('div', {
+      className: 'pfg-card' + (card.closed ? ' pfg-closed' : '') + (card.wait ? ' pfg-hasw' : '') + (drag && drag.card.id === card.id ? ' pfg-dragging' : ''),
+      'data-pfg-card': card.id,
+      style: { '--c': color },
+      draggable: true,
+      onDragStart: e => {
+        e.dataTransfer.effectAllowed = 'move'
+        e.dataTransfer.setData('text/plain', card.id)
+        setDrag({ card, over: null })
+      },
+      onDragEnd: () => setDrag(null),
+      onClick: e => openCard(card, e.ctrlKey || e.metaKey ? 'tab' : undefined),
+      onAuxClick: e => {
+        if (e.button !== 1) return
+        e.preventDefault()
+        openCard(card, 'tab')
+      },
+      children: jsxs('div', {
+        className: 'pfg-in',
+        ref: el => (el ? titleEls.current.set(card.id, el) : titleEls.current.delete(card.id)),
+        children: [pill(card), jsx('span', { children: card.title }, 't')]
+      })
+    })
+    return jsx(WithContextMenu, { items: menuFor(card), children: el }, 'c:' + card.id)
+  }
+
+  // Measure every title block, keep the tallest; re-measure when the pane width
+  // or the cards change.
+  useLayoutEffect(() => {
+    let max = 0
+    let line = 16
+    for (const el of titleEls.current.values()) {
+      if (!el) continue
+      max = Math.max(max, el.offsetHeight)
+      const lh = parseFloat(getComputedStyle(el).lineHeight)
+      if (lh) line = lh
+    }
+    const h = Math.ceil(Math.max(max, CARD_MIN_LINES * line)) + CARD_PAD
+    if (max && h !== cardH) setCardH(h)
+  })
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el || typeof ResizeObserver !== 'function') return
+    const ro = new ResizeObserver(entries => {
+      const w = Math.round(entries[0]?.contentRect?.width || 0)
+      setWidth(prev => (prev === w ? prev : w))
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [rows == null])
+  void width // a width change re-renders, the layout effect re-measures
+
+  const colTemplate = '92px ' + cols.map(c => (c.empty ? '38px' : 'minmax(156px, 1fr)')).join(' ')
+  const cellClass = (c, row) => 'pfg-cell' + (c.empty ? ' pfg-band' : '') + (drag && drag.card.colId === c.id && drag.over === row && drag.over !== drag.card.status ? ' pfg-over' : '')
+  const children = [jsx('div', { className: 'pfg-corner' }, 'corner')]
+  for (const c of cols) {
+    const n = c.cells.cours.length + c.cells.veille.length
+    children.push(
+      jsxs('div', {
+        className: 'pfg-colh' + (c.empty ? ' pfg-band' : ''),
+        style: { '--c': c.color || 'var(--ui-stroke-secondary)' },
+        title: c.org ? c.name + ' · ' + n + ' ouverte' + (n > 1 ? 's' : '') + '\nClic : replier dans la barre latérale' : c.name,
+        onClick: () => c.org && foldToSidebar(c.id),
+        children: c.empty ? [orgShort(c.name)] : [jsx('span', { children: c.org ? orgLabel(c.name) : c.name }, 'n'), jsx('span', { className: 'pfg-n', children: n }, 'c')]
+      }, 'h:' + c.id)
+    )
+  }
+  for (const r of GRID_ROWS) {
+    const count = cols.reduce((n, c) => n + c.cells[r.key].length, 0)
+    const folded = r.key === 'clos' && !showClosed
+    children.push(
+      jsxs('div', {
+        className: 'pfg-rowh' + (r.key === 'clos' ? ' pfg-fold' : ''),
+        onClick: r.key === 'clos' ? () => setShowClosed(!showClosed) : undefined,
+        children: [jsx('span', { children: r.label + (r.key === 'clos' ? (showClosed ? ' ▾' : ' ▸') : '') }, 'l'), jsx('span', { className: 'pfg-n', children: count }, 'n')]
+      }, 'r:' + r.key)
+    )
+    for (const c of cols) {
+      const cards = c.cells[r.key]
+      const color = c.color || 'var(--ui-stroke-secondary)'
+      children.push(
+        jsx('div', {
+          className: cellClass(c, r.key) + (folded ? ' pfg-thin' : ''),
+          'data-pfg-row': r.key,
+          'data-pfg-col': c.id,
+          title: c.empty && !folded ? c.name + ' : aucune conversation ouverte' : undefined,
+          onClick: folded ? () => setShowClosed(true) : undefined,
+          ...cellDnd(r.key, c.id),
+          children: folded ? (cards.length ? String(cards.length) : '') : cards.map(card => cardEl(card, color))
+        }, 'x:' + r.key + ':' + c.id)
+      )
+    }
+  }
+
+  let content
+  if (rows == null && !error) content = jsx('div', { className: 'pfg-meta', style: { padding: 20 }, children: 'Chargement…' })
+  else if (rows == null) content = jsx('div', { className: 'pfg-meta', style: { padding: 20 }, children: 'Impossible de charger les conversations : ' + error })
+  else content = jsx('div', { className: 'pfg-grid', style: { gridTemplateColumns: colTemplate, ...(cardH ? { '--pfg-h': cardH + 'px' } : {}) }, children })
+
+  return jsxs('div', {
+    'data-pinned-folders': '',
+    'data-pf-grid': '',
+    children: [
+      jsx('style', { children: GRID_CSS }, 'css'),
+      jsxs('div', {
+        className: 'pfg-head',
+        children: [
+          jsx('span', { className: 'pfg-title', children: 'Conversations' }, 't'),
+          jsx('span', { className: 'pfg-meta', children: open + ' ouvertes · ' + waiting + ' en attente · ' + closedN + ' closes' }, 'm'),
+          jsx('span', { className: 'pfg-hint', children: 'Clic droit : statut, attente · Glisser vers une autre ligne : changer le statut · Clic sur une société : la replier' }, 'h')
+        ]
+      }, 'head'),
+      jsx('div', { className: 'pfg-scroll', ref: scrollRef, children: content }, 'scroll'),
+      jsx(WaitDialog, {
+        card: waitCard,
+        onClose: () => setWaitCard(null),
+        onSubmit: (who, due) => {
+          const id = waitCard.id
+          setWaitCard(null)
+          setTree(t => ops.setWait(t, id, who, due))
+        }
+      }, 'wait')
+    ]
+  })
+}
+
 // ── Sujets view (v0.7.0) ─────────────────────────────────────────────────────
 // The default view of the tab: every chat in one list sorted by last activity,
 // grouped by date, with the company buttons as filter (v0.7.1) and hover actions.
@@ -2264,6 +2818,10 @@ const SUBJECTS_CSS = `
 [data-pf-subjects] .pfs-crow{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;font-size:0.75rem;color:var(--ui-text-tertiary)}
 [data-pf-subjects] .pfs-crow:hover{background:var(--ui-control-hover-background)}
 [data-pf-subjects] .pfs-reopen{border:1px solid var(--ui-stroke-tertiary);border-radius:6px;padding:1px 8px;font-size:0.6875rem;cursor:pointer;background:transparent;color:inherit}
+[data-pf-subjects] .pfs-wait{display:inline-flex;align-items:center;gap:2px;height:16px;padding:0 6px 0 4px;margin-left:6px;border-radius:8px;background:var(--theme-primary);color:var(--primary-foreground, #fff);font-size:0.625rem;font-weight:700;white-space:nowrap;flex-shrink:0;align-self:center}
+[data-pf-subjects] .pfs-wait.pfs-late{background:var(--ui-red, #E5484D);color:#fff}
+[data-pf-subjects] .pfs-back{display:inline-flex;align-items:center;gap:4px;height:22px;padding:0 8px;border-radius:6px;border:1px solid var(--ui-stroke-tertiary);background:transparent;color:inherit;font-size:0.6875rem;font-weight:600;cursor:pointer}
+[data-pf-subjects] .pfs-back:hover{background:var(--ui-control-hover-background)}
 [data-pf-subjects] .pfs-reopen:hover{background:var(--ui-control-active-background, var(--ui-control-hover-background));color:var(--foreground, inherit)}
 `
 
@@ -2285,6 +2843,17 @@ function SubjectsPane({ onSwitch }) {
 
   const [query, setQuery] = useState('')
   const [orgSel, setOrgSel] = useState(() => store.get('subjectsOrgs', []))
+  const [groupBy, setGroupByRaw] = useState(() => (store.get('subjectsGroup', 'date') === 'status' ? 'status' : 'date'))
+  const setGroupBy = g => {
+    setGroupByRaw(g)
+    store.set('subjectsGroup', g)
+  }
+  // A company folded out of the grid: show it alone, grouped by status.
+  useEffect(() => onBus(ev => {
+    if (ev.type !== 'subjects-focus') return
+    setOrgSel(ev.orgs)
+    setGroupByRaw(ev.group)
+  }), [])
   const [openGroups, setOpenGroups] = useState({})
   const [showClosed, setShowClosed] = useState(false)
   const [editing, setEditing] = useState(null)
@@ -2303,7 +2872,12 @@ function SubjectsPane({ onSwitch }) {
   const all = useMemo(() => subjectRows(tree, rows), [tree, rows])
   const counts = useMemo(() => orgCounts(all), [all])
   const visible = useMemo(() => filterSubjects(all, { orgs, query }), [all, orgs, query])
-  const groups = useMemo(() => groupSubjects(visible, now), [visible, Math.floor(now / 60000)])
+  const groups = useMemo(() => (groupBy === 'status' ? groupByStatus(tree, visible) : groupSubjects(visible, now)), [visible, groupBy, tree, Math.floor(now / 60000)])
+  const backToGrid = () => {
+    setGroupBy('date')
+    setOrgs(store.get('subjectsOrgsBefore', []))
+    openGrid()
+  }
   const rowById = useMemo(() => new Map((rows || []).map(r => [r.id, r])), [rows])
   const liveIds = useMemo(() => new Set((rows || []).map(r => r.id)), [rows])
   const closed = closedList(tree, liveIds)
@@ -2368,7 +2942,7 @@ function SubjectsPane({ onSwitch }) {
     store.set(CLOSED_TITLES_KEY, nextTitles)
     setClosedTitles(nextTitles)
     dropRow(row.id)
-    setTree(t => ops.closeSession(t, row.id))
+    setTree(t => ops.closeSession(t, row.id, title))
     setArchived(row.id, row.profile, true)
       .then(() => host.notify({ kind: 'success', message: '« ' + title + ' » clos', durationMs: 2500 }))
       .catch(err => {
@@ -2454,7 +3028,14 @@ function SubjectsPane({ onSwitch }) {
                   children: [
                     s.general ? jsx('span', { className: 'pfs-gico', title: 'Conversation générale', children: jsx(Codicon, { name: 'comment-discussion', size: '0.75rem' }) }, 'gi') : null,
                     jsx('span', { className: 'pfs-tx', children: (s.pinned ? '📌 ' : '') + subjectTitle(s) }, 'tx'),
-                    s.unsorted ? jsx('span', { className: 'pfs-tri', children: 'à ranger' }, 'tri') : null
+                    s.unsorted ? jsx('span', { className: 'pfs-tri', children: 'à ranger' }, 'tri') : null,
+                    tree.wait && tree.wait[row.id]
+                      ? jsxs('span', {
+                          className: 'pfs-wait' + (waitLate(tree.wait[row.id], now) ? ' pfs-late' : ''),
+                          title: waitDetail(tree.wait[row.id], now),
+                          children: [jsx(Codicon, { name: 'debug-pause', size: '0.625rem' }, 'i'), jsx('span', { children: waitShort(tree.wait[row.id].who) }, 'w')]
+                        }, 'wait')
+                      : null
                   ]
                 }, 'tt'),
             sub ? jsx('div', { className: 'pfs-sub', children: sub }, 'sub') : null
@@ -2537,6 +3118,9 @@ function SubjectsPane({ onSwitch }) {
         style: { display: 'flex', alignItems: 'center', gap: 2, padding: '8px 6px 2px 10px', flexShrink: 0 },
         children: [
           jsx('span', { style: { flex: 1, fontSize: '0.64rem', fontWeight: 600, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--theme-primary)' }, children: 'Sujets' }, 'label'),
+          groupBy === 'status'
+            ? jsxs('button', { type: 'button', className: 'pfs-back', title: 'Revenir à la grille', onClick: backToGrid, children: [jsx(Codicon, { name: 'arrow-left', size: '0.75rem' }, 'i'), jsx('span', { children: 'Grille' }, 't')] }, 'back')
+            : jsx(IconButton, { icon: 'project', title: 'Ouvrir la grille', onClick: openGrid }, 'grid'),
           jsx(IconButton, { icon: 'list-tree', title: 'Revenir à la vue Dossiers', onClick: () => onSwitch('dossiers') }, 'sw'),
           jsx(RowMenu, { items: moreItems, icon: 'kebab-vertical', label: 'Plus' }, 'more')
         ]
@@ -2590,6 +3174,7 @@ function DossiersTab() {
     setModeRaw(m)
     store.set('mode', m)
   }
+  useEffect(() => onBus(ev => ev.type === 'subjects-focus' && setModeRaw('sujets')), [])
   return mode === 'dossiers' ? jsx(PinnedPane, { onSwitch: setMode }) : jsx(SubjectsPane, { onSwitch: setMode })
 }
 
@@ -2615,5 +3200,11 @@ export default {
       },
       render: () => jsx(DossiersTab, {})
     })
+    ctx.register({
+      id: 'grid-open',
+      area: 'palette',
+      data: { id: 'pinned-folders.grid', label: 'Ouvrir la grille des conversations', keywords: ['grille', 'grid', 'sujets', 'conversations', 'statut'], run: () => openGrid() }
+    })
+    ctx.onDispose(() => closeGrid())
   }
 }
