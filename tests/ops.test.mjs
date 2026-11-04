@@ -730,7 +730,7 @@ if (FULL) {
   // closedList: still-archived ones only, newest closed first
   assert(closedList({ closed: ['a', 'b', 'c'] }, new Set(['b'])).join() === 'c,a', 'closedList hides chats back in the list, newest first')
 
-  // subjectRows: company/activity, generals, archived, sub-sessions, cron out
+  // subjectRows: company/activity, generals in (v0.7.1), archived, sub-sessions, cron out
   const T = normalize({ folders: [
     { id: 'ap', name: 'Apoleos', parent: null, generalSession: 'gen' },
     { id: 'dir', name: 'Direction', parent: 'ap' },
@@ -752,7 +752,13 @@ if (FULL) {
   ]
   assert(isSubjectRow(R[0]) && !isSubjectRow(R[5]) && !isSubjectRow(R[6]) && !isSubjectRow(R[7]), 'isSubjectRow: archived, sub-sessions and cron are out')
   const L = subjectRows(T, R)
-  assert(L.map(s => s.id).join() === 's1,s4,s2,s3', 'subjectRows: newest first, general/archived/sub/cron left out: ' + L.map(s => s.id).join())
+  assert(L.map(s => s.id).join() === 'gen,s1,s4,s2,s3', 'subjectRows: newest first, general kept, archived/sub/cron left out: ' + L.map(s => s.id).join())
+  const gen = L.find(s => s.id === 'gen')
+  assert(gen.general && gen.orgId === 'ap' && gen.activity === '' && !gen.unsorted, 'General chat is in the list, flagged, under its company')
+  assert(!L.find(s => s.id === 's1').general, 'ordinary chat is not flagged general')
+  const T2 = normalize({ folders: [{ id: 'pa', name: 'Panorama', parent: null, generalSession: 'g2' }], placed: {}, order: [], foldersOrdered: true })
+  const g2 = subjectRows(T2, [{ id: 'g2', title: 'Panorama – Général', last_active: sec(now) }])[0]
+  assert(g2.general && g2.orgId === 'pa', 'General chat goes with its company even if not in placed')
   const s1 = L.find(s => s.id === 's1'), s2 = L.find(s => s.id === 's2'), s4 = L.find(s => s.id === 's4'), s3 = L.find(s => s.id === 's3')
   assert(s1.orgId === 'ap' && s1.activity === 'Direction', 'company = root folder, activity = sub-folder')
   assert(s2.orgId === 'ap' && s2.activity === '', 'chat filed at the root: company only, no activity')
@@ -763,18 +769,26 @@ if (FULL) {
   assert(orgShort('GEEIS+') === 'G+' && orgShort('Apoleos') === 'AP' && orgShort('GUYADER SI Consulting') === 'GU', 'orgShort: two-letter tags')
   assert(orgLabel('GUYADER SI Consulting') === 'GUYADER SI' && orgLabel('Perso') === 'Perso', 'orgLabel shortens long names')
   // filters
-  assert(filterSubjects(L, { orgs: ['ap'] }).map(s => s.id).join() === 's1,s2', 'company filter keeps only that company')
-  assert(filterSubjects(L, { orgs: new Set(['ap', 'pe']) }).length === 3, 'two companies combine')
+  assert(filterSubjects(L, { orgs: ['ap'] }).map(s => s.id).join() === 'gen,s1,s2', 'company filter keeps only that company, its General included')
+  assert(filterSubjects(L, { orgs: ['pe'] }).map(s => s.id).join() === 's3', 'company filter leaves out the other companies’ General')
+  assert(filterSubjects(L, { orgs: new Set(['ap', 'pe']) }).length === 4, 'two companies combine')
   assert(filterSubjects(L, { query: 'direc' }).map(s => s.id).join() === 's1', 'text filter matches the activity')
   assert(filterSubjects(L, { query: 'SINISTRE' }).map(s => s.id).join() === 's3', 'text filter matches the title, any case')
   assert(filterSubjects(L, { orgs: ['ap'], query: 'numeum' }).map(s => s.id).join() === 's2', 'company and text filters combine')
-  assert(filterSubjects(L, {}).length === 4, 'no filter shows everything')
+  assert(filterSubjects(L, {}).length === 5, 'no filter shows everything, General included')
+  // company buttons = filter: click, ctrl+click AP + PE, click again on the only active one
+  let sel = toggleOrgFilter([], 'ap', false)
+  assert(filterSubjects(L, { orgs: sel }).every(s => s.orgId === 'ap'), 'button AP: only Apoleos')
+  sel = toggleOrgFilter(sel, 'pe', true)
+  assert(sel.join() === 'ap,pe' && filterSubjects(L, { orgs: sel }).length === 4, 'ctrl+click PE: Apoleos + Perso')
+  sel = toggleOrgFilter(toggleOrgFilter(sel, 'pe', false), 'pe', false)
+  assert(sel.length === 0 && filterSubjects(L, { orgs: sel }).length === 5, 'click again on the only active button: no filter')
   assert(toggleOrgFilter([], 'a', false).join() === 'a', 'pill click: only this company')
   assert(toggleOrgFilter(['a'], 'a', false).length === 0, 'pill click on the only active pill clears the filter')
   assert(toggleOrgFilter(['a', 'b'], 'a', false).join() === 'a', 'plain click with several active keeps only that one')
   assert(toggleOrgFilter(['a'], 'b', true).join() === 'a,b' && toggleOrgFilter(['a', 'b'], 'a', true).join() === 'b', 'ctrl+click adds / removes')
   const cnt = orgCounts(L)
-  assert(cnt.get('ap') === 2 && cnt.get('pe') === 1 && !cnt.get('gu'), 'orgCounts per company')
+  assert(cnt.get('ap') === 2 && cnt.get('pe') === 1 && !cnt.get('gu'), 'orgCounts per company, General not counted')
   // date groups
   const D = 24 * H
   assert(dateBucket(now - H, now) === 'today' && dateBucket(now - 16 * H, now) === 'yesterday', 'dateBucket today / yesterday (calendar days)')

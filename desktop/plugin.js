@@ -621,20 +621,22 @@ export function isSubjectRow(row) {
   return !!row && !row.archived && !row.parent_session_id && row.source !== 'cron'
 }
 
-// Rows -> subjects, newest activity first. General chats are left out (they
-// have their own buttons on top).
+// Rows -> subjects, newest activity first. General chats are in the list too
+// (v0.7.1), flagged `general`, and filed under their company.
 export function subjectRows(t, rows) {
   const byId = new Map((t.folders || []).map(f => [f.id, f]))
   const generals = generalIds(t)
   const pinned = new Set(t.pinned || [])
   const out = []
   for (const row of rows || []) {
-    if (!isSubjectRow(row) || generals.has(row.id)) continue
-    const fid = t.placed?.[row.id]
+    if (!isSubjectRow(row)) continue
+    const general = generals.has(row.id)
+    const genOf = general ? (t.folders || []).find(f => f.generalSession === row.id) : null
+    const fid = genOf ? genOf.id : t.placed?.[row.id]
     const chain = fid && byId.has(fid) ? ancestorsOf(byId, fid) : []
     const org = chain.length ? chain[chain.length - 1] : null
     const activity = chain.length > 1 ? chain[0].name : ''
-    out.push({ id: row.id, row, org, orgId: org ? org.id : null, activity, unsorted: !org, pinned: pinned.has(row.id), ms: recencyMs(row) })
+    out.push({ id: row.id, row, org, orgId: org ? org.id : null, activity, unsorted: !org, pinned: pinned.has(row.id), general, ms: recencyMs(row) })
   }
   return out.sort((a, b) => b.ms - a.ms)
 }
@@ -653,7 +655,7 @@ export function filterSubjects(list, { orgs, query } = {}) {
   })
 }
 
-// Company pill click: plain click = only this company (again on the only
+// Company button click: plain click = only this company (again on the only
 // active one = no filter); Ctrl/⌘-click adds or removes it.
 export function toggleOrgFilter(selected, id, multi) {
   const cur = [...(selected || [])]
@@ -661,9 +663,10 @@ export function toggleOrgFilter(selected, id, multi) {
   return cur.length === 1 && cur[0] === id ? [] : [id]
 }
 
+// Subjects per company (General chats not counted).
 export function orgCounts(list) {
   const m = new Map()
-  for (const s of list || []) if (s.orgId) m.set(s.orgId, (m.get(s.orgId) || 0) + 1)
+  for (const s of list || []) if (s.orgId && !s.general) m.set(s.orgId, (m.get(s.orgId) || 0) + 1)
   return m
 }
 
@@ -2224,7 +2227,7 @@ function PinnedPane({ onSwitch } = {}) {
 
 // ── Sujets view (v0.7.0) ─────────────────────────────────────────────────────
 // The default view of the tab: every chat in one list sorted by last activity,
-// grouped by date, with company pills, the General buttons and hover actions.
+// grouped by date, with the company buttons as filter (v0.7.1) and hover actions.
 // The folder view stays one click away (filet de sécurité).
 
 const SUBJECTS_CSS = `
@@ -2250,12 +2253,10 @@ const SUBJECTS_CSS = `
 [data-pf-subjects] .pfs-gens{display:grid;grid-template-columns:repeat(auto-fill,minmax(38px,1fr));gap:4px}
 [data-pf-subjects] .pfs-gen{height:28px;border-radius:7px;border:1px solid var(--ui-stroke-tertiary);background:var(--ui-bg-card, transparent);display:flex;align-items:center;justify-content:center;font-size:0.6875rem;font-weight:600;cursor:pointer;position:relative}
 [data-pf-subjects] .pfs-gen:hover{background:var(--ui-control-hover-background)}
+[data-pf-subjects] .pfs-gen.pfs-on{background:var(--ui-control-active-background, var(--ui-control-hover-background));border-color:currentColor;box-shadow:inset 0 0 0 1px currentColor}
+[data-pf-subjects] .pfs-gen.pfs-off{opacity:.4}
+[data-pf-subjects] .pfs-gico{display:inline-flex;margin-right:5px;color:var(--ui-text-tertiary);flex-shrink:0;align-self:center}
 [data-pf-subjects] .pfs-gen .pfs-nu{position:absolute;top:3px;right:4px;width:6px;height:6px;border-radius:50%;background:var(--ui-accent, var(--theme-primary))}
-[data-pf-subjects] .pfs-orgs{display:flex;gap:4px;flex-wrap:wrap}
-[data-pf-subjects] .pfs-org{display:flex;align-items:center;gap:5px;padding:2px 8px;border-radius:14px;border:1px solid var(--ui-stroke-tertiary);font-size:0.71875rem;cursor:pointer;user-select:none;color:var(--ui-text-tertiary)}
-[data-pf-subjects] .pfs-org i{width:7px;height:7px;border-radius:50%;display:inline-block}
-[data-pf-subjects] .pfs-org.pfs-on{color:var(--foreground, inherit);background:var(--ui-control-active-background, var(--ui-control-hover-background));border-color:var(--ui-stroke-secondary, var(--ui-stroke-tertiary))}
-[data-pf-subjects] .pfs-org.pfs-off{opacity:.45}
 [data-pf-subjects] .pfs-new{border-radius:7px;padding:0 10px;height:28px;font-weight:600;font-size:0.75rem;white-space:nowrap;cursor:pointer;border:0;background:var(--theme-primary);color:var(--primary-foreground, #fff)}
 [data-pf-subjects] .pfs-new:hover{filter:brightness(1.08)}
 [data-pf-subjects] .pfs-foot{border-top:1px solid var(--ui-stroke-tertiary);padding:6px 12px;font-size:0.71875rem;color:var(--ui-text-tertiary);display:flex;justify-content:space-between;flex-shrink:0}
@@ -2420,7 +2421,8 @@ function SubjectsPane({ onSwitch }) {
     const row = s.row
     const renaming = editing === row.id
     const color = orgColor(s.org) || 'var(--ui-text-quaternary, #777)'
-    const sub = s.unsorted ? '' : single ? s.activity || '—' : orgLabel(s.org.name) + (s.activity ? ' · ' + s.activity : '')
+    const what = s.general ? 'Général' : s.activity
+    const sub = s.unsorted ? '' : single ? what || '—' : orgLabel(s.org.name) + (what ? ' · ' + what : '')
     const el = jsxs('div', {
       className: 'pfs-row' + (focused === row.id ? ' pfs-sel' : '') + (dateBucket(s.ms, now) === 'today' ? ' pfs-fresh' : ''),
       'data-subject': row.id,
@@ -2450,6 +2452,7 @@ function SubjectsPane({ onSwitch }) {
               : jsxs('div', {
                   className: 'pfs-tt',
                   children: [
+                    s.general ? jsx('span', { className: 'pfs-gico', title: 'Conversation générale', children: jsx(Codicon, { name: 'comment-discussion', size: '0.75rem' }) }, 'gi') : null,
                     jsx('span', { className: 'pfs-tx', children: (s.pinned ? '📌 ' : '') + subjectTitle(s) }, 'tx'),
                     s.unsorted ? jsx('span', { className: 'pfs-tri', children: 'à ranger' }, 'tri') : null
                   ]
@@ -2475,43 +2478,30 @@ function SubjectsPane({ onSwitch }) {
     return jsx(WithContextMenu, { items: menuFor(s), children: el }, 's:' + row.id)
   }
 
-  const generalsBar = roots.filter(f => f.generalSession)
-  const gens = generalsBar.length
+  // Company buttons (v0.7.1): the filter. Click = only this company, Ctrl/⌘ =
+  // combine, click on the only active one = no filter. The dot = its General
+  // chat was active today.
+  const gens = roots.length
     ? jsx('div', {
         className: 'pfs-gens',
-        children: generalsBar.map(f => {
-          const g = rowById.get(f.generalSession)
+        children: roots.map(f => {
+          const g = f.generalSession ? rowById.get(f.generalSession) : null
           const fresh = g && dateBucket(recencyMs(g), now) === 'today'
+          const n = counts.get(f.id) || 0
+          const on = orgs.has(f.id)
           return jsxs('div', {
-            className: 'pfs-gen',
+            className: 'pfs-gen' + (on ? ' pfs-on' : orgs.size ? ' pfs-off' : ''),
             role: 'button',
-            title: f.name + ' – Général' + (fresh ? ' (active aujourd’hui)' : ''),
+            'aria-pressed': on,
+            'data-org': f.id,
+            title: f.name + ' · ' + n + ' sujet' + (n > 1 ? 's' : '') + (fresh ? ' · Général actif aujourd’hui' : '') + '\nClic : seulement ' + f.name + ' · Ctrl+clic : combiner',
             style: { color: orgColor(f) || undefined },
-            onClick: e =>
-              host
-                .openSession(f.generalSession, { profile: g?.profile || undefined, ...(e.ctrlKey || e.metaKey ? { intent: 'tab' } : {}) })
-                .catch(err => host.notifyError(err, 'Impossible d’ouvrir la conversation générale')),
+            onClick: e => setOrgs(toggleOrgFilter([...orgs], f.id, e.ctrlKey || e.metaKey)),
             children: [orgShort(f.name), fresh ? jsx('span', { className: 'pfs-nu' }, 'nu') : null]
           }, f.id)
         })
       }, 'gens')
     : null
-
-  const pills = jsx('div', {
-    className: 'pfs-orgs',
-    children: roots.map(f =>
-      jsxs('span', {
-        className: 'pfs-org' + (orgs.has(f.id) ? ' pfs-on' : orgs.size ? ' pfs-off' : ''),
-        title: 'Clic : seulement ' + f.name + ' · Ctrl+clic : combiner',
-        onClick: e => setOrgs(toggleOrgFilter([...orgs], f.id, e.ctrlKey || e.metaKey)),
-        children: [
-          jsx('i', { style: { background: orgColor(f) || 'var(--ui-text-quaternary)' } }, 'i'),
-          orgLabel(f.name),
-          jsx('span', { style: { color: 'var(--ui-text-quaternary, var(--ui-text-tertiary))' }, children: counts.get(f.id) || 0 }, 'n')
-        ]
-      }, f.id)
-    )
-  }, 'orgs')
 
   let body
   if (rows == null && !error) body = [jsx('div', { className: 'pfs-more', children: 'Chargement…' }, 'l')]
@@ -2561,8 +2551,7 @@ function SubjectsPane({ onSwitch }) {
               jsx('button', { type: 'button', className: 'pfs-new', onClick: () => host.newChat?.(), children: '+ Nouveau' }, 'n')
             ]
           }, 'r1'),
-          gens,
-          pills
+          gens
         ]
       }, 'top'),
       jsx('div', { style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '0 6px 8px' }, children: body }, 'list'),
