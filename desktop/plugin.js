@@ -31,6 +31,9 @@ import {
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
   ContextMenuTrigger,
   Dialog,
   DialogContent,
@@ -81,7 +84,7 @@ export function normalizeView(v) {
   return { order: pick('order'), unreadOnly: src.unreadOnly === true, pinnedOnly: src.pinnedOnly === true, status: pick('status'), profile: pick('profile') }
 }
 
-const empty = () => ({ folders: [], placed: {}, order: [], pinned: [], collapsed: {}, foldersOrdered: true, view: { ...DEFAULT_VIEW } })
+const empty = () => ({ folders: [], placed: {}, order: [], pinned: [], closed: [], collapsed: {}, foldersOrdered: true, view: { ...DEFAULT_VIEW } })
 
 // Folder order is the user's (array order). Layouts saved before manual
 // ordering existed were shown alphabetically, so sort them once on load.
@@ -96,6 +99,8 @@ export function normalize(v) {
     placed: v.placed && typeof v.placed === 'object' ? v.placed : {},
     order: Array.isArray(v.order) ? v.order : [],
     pinned: Array.isArray(v.pinned) ? v.pinned.filter(x => typeof x === 'string') : [],
+    // Sujets view: chats closed with « Clore » (archived, listed under Clos).
+    closed: Array.isArray(v.closed) ? [...new Set(v.closed.filter(x => typeof x === 'string' && x))] : [],
     collapsed: v.collapsed && typeof v.collapsed === 'object' ? v.collapsed : {},
     foldersOrdered: true,
     view: normalizeView(v.view)
@@ -254,10 +259,23 @@ export const ops = {
   forgetSession(t, sid) {
     t = clearGeneralElsewhere(t, sid, undefined)
     const pinned = (t.pinned || []).filter(x => x !== sid)
-    if (!(sid in t.placed) && !t.order.includes(sid) && pinned.length === (t.pinned || []).length) return t
+    const closed = (t.closed || []).filter(x => x !== sid)
+    if (!(sid in t.placed) && !t.order.includes(sid) && pinned.length === (t.pinned || []).length && closed.length === (t.closed || []).length) return t
     const placed = { ...t.placed }
     delete placed[sid]
-    return { ...t, placed, pinned, order: t.order.filter(x => x !== sid) }
+    return { ...t, placed, pinned, closed, order: t.order.filter(x => x !== sid) }
+  },
+  // Clore (Sujets view): the chat is archived by the caller and noted here; it
+  // keeps its folder and pin, so Rouvrir puts it back where it was.
+  closeSession(t, sid) {
+    if (!sid) return t
+    const cur = t.closed || []
+    return { ...t, closed: [...cur.filter(x => x !== sid), sid] }
+  },
+  reopenSession(t, sid) {
+    const cur = t.closed || []
+    if (!cur.includes(sid)) return t
+    return { ...t, closed: cur.filter(x => x !== sid) }
   },
   // Pinned = a subject in progress: a pin mark on the row, the chat stays where
   // it is filed; the "Épinglées seulement" filter isolates them.
@@ -571,6 +589,136 @@ export function folderOf(t, ids, sid) {
 
 const byName = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
 
+// ── Sujets view (v0.7.0): pure helpers, exported for tests ──────────────────
+// One flat list of chats sorted by last activity, grouped by date, filtered by
+// company (root folder) and text. Company = root folder of the chat's folder;
+// activity = the folder it is filed in when that is not the root itself.
+
+// Default company colors (maquette v6) when a root folder has no color of its own.
+const ORG_COLORS = { apoleos: '#6E78E6', geeis: '#34B37A', tendr: '#1BB3C7', perso: '#9A9AA2', 'guyader-si-consulting': '#D08A34', panorama: '#D94FA8' }
+
+export function orgColor(f) {
+  if (!f) return null
+  if (typeof f.color === 'string' && f.color) return f.color
+  return ORG_COLORS[slugify(f.name)] || null
+}
+
+// Two-letter tag for the General buttons: "GEEIS+" -> "G+", "Apoleos" -> "AP".
+export function orgShort(name) {
+  const n = String(name || '').trim()
+  if (n.includes('+')) return (n[0] || '').toUpperCase() + '+'
+  return slugify(n).replace(/-/g, '').slice(0, 2).toUpperCase()
+}
+
+// Company name for the sub-line: long names keep their first two words.
+export function orgLabel(name) {
+  const w = String(name || '').trim().split(/\s+/)
+  return w.length > 2 ? w.slice(0, 2).join(' ') : w.join(' ')
+}
+
+// A chat the Sujets list shows: not archived, not a sub-session, not cron.
+export function isSubjectRow(row) {
+  return !!row && !row.archived && !row.parent_session_id && row.source !== 'cron'
+}
+
+// Rows -> subjects, newest activity first. General chats are left out (they
+// have their own buttons on top).
+export function subjectRows(t, rows) {
+  const byId = new Map((t.folders || []).map(f => [f.id, f]))
+  const generals = generalIds(t)
+  const pinned = new Set(t.pinned || [])
+  const out = []
+  for (const row of rows || []) {
+    if (!isSubjectRow(row) || generals.has(row.id)) continue
+    const fid = t.placed?.[row.id]
+    const chain = fid && byId.has(fid) ? ancestorsOf(byId, fid) : []
+    const org = chain.length ? chain[chain.length - 1] : null
+    const activity = chain.length > 1 ? chain[0].name : ''
+    out.push({ id: row.id, row, org, orgId: org ? org.id : null, activity, unsorted: !org, pinned: pinned.has(row.id), ms: recencyMs(row) })
+  }
+  return out.sort((a, b) => b.ms - a.ms)
+}
+
+export const subjectTitle = s => s.row.title || s.row.preview || 'Sans titre'
+
+// Company filter (ids of root folders; empty = all) and text query on the
+// title and the activity.
+export function filterSubjects(list, { orgs, query } = {}) {
+  const sel = orgs instanceof Set ? orgs : new Set(orgs || [])
+  const q = String(query || '').trim().toLowerCase()
+  return (list || []).filter(s => {
+    if (sel.size && !(s.orgId && sel.has(s.orgId))) return false
+    if (q && !(subjectTitle(s) + ' ' + s.activity).toLowerCase().includes(q)) return false
+    return true
+  })
+}
+
+// Company pill click: plain click = only this company (again on the only
+// active one = no filter); Ctrl/⌘-click adds or removes it.
+export function toggleOrgFilter(selected, id, multi) {
+  const cur = [...(selected || [])]
+  if (multi) return cur.includes(id) ? cur.filter(x => x !== id) : [...cur, id]
+  return cur.length === 1 && cur[0] === id ? [] : [id]
+}
+
+export function orgCounts(list) {
+  const m = new Map()
+  for (const s of list || []) if (s.orgId) m.set(s.orgId, (m.get(s.orgId) || 0) + 1)
+  return m
+}
+
+const dayStart = ms => {
+  const d = new Date(ms)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+
+export const DATE_GROUPS = [
+  { key: 'today', label: 'Aujourd’hui', limit: Infinity },
+  { key: 'yesterday', label: 'Hier', limit: Infinity },
+  { key: 'week', label: 'Cette semaine', limit: Infinity },
+  { key: 'month', label: 'Ce mois-ci', limit: 5 },
+  { key: 'older', label: 'Plus ancien', limit: 0 }
+]
+
+// Calendar days between the chat and the current time (local): 0 today, 1 yesterday, <7 this
+// week, <31 this month, else older.
+export function dateBucket(ms, now) {
+  const d = Math.round((dayStart(now) - dayStart(ms)) / 86400000)
+  return d < 1 ? 'today' : d < 2 ? 'yesterday' : d < 7 ? 'week' : d < 31 ? 'month' : 'older'
+}
+
+// Right-hand time of a row: hour today, "hier", weekday this week, else date.
+export function timeLabel(ms, now) {
+  const b = dateBucket(ms, now)
+  const d = new Date(ms)
+  if (b === 'today') return d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+  if (b === 'yesterday') return 'hier'
+  if (b === 'week') return d.toLocaleDateString('fr-FR', { weekday: 'short' })
+  return d.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })
+}
+
+// Non-empty date groups in display order, each with its own cut: "Ce mois-ci"
+// shows 5 rows then "+ N autres", "Plus ancien" starts folded.
+export function groupSubjects(list, now) {
+  const by = new Map(DATE_GROUPS.map(g => [g.key, []]))
+  for (const s of list || []) by.get(dateBucket(s.ms, now)).push(s)
+  return DATE_GROUPS.filter(g => by.get(g.key).length).map(g => ({ ...g, rows: by.get(g.key) }))
+}
+
+// The rows a group shows, and how many it keeps behind "+ N autres".
+export function shownInGroup(group, open) {
+  const shown = open ? group.rows : group.rows.slice(0, group.limit)
+  return { shown, hidden: group.rows.length - shown.length }
+}
+
+// Closed chats still archived (a chat un-archived elsewhere is back in the
+// list and leaves this section), most recently closed first.
+export function closedList(t, liveIds) {
+  const live = liveIds instanceof Set ? liveIds : new Set(liveIds || [])
+  return [...(t.closed || [])].filter(id => !live.has(id)).reverse()
+}
+
 // ── pinned rows: the backend's own pinned flag, all profiles ─────────────────
 // limit=0 + include_pinned back-fill = exactly the pinned rows, nothing else.
 
@@ -635,7 +783,7 @@ const SYNC_MS = 4000
 const PUSH_DELAY_MS = 400
 
 export function sharedPart(t) {
-  return { folders: t.folders, placed: t.placed, order: t.order, pinned: t.pinned || [], foldersOrdered: true }
+  return { folders: t.folders, placed: t.placed, order: t.order, pinned: t.pinned || [], closed: t.closed || [], foldersOrdered: true }
 }
 
 // Server layout + this app's local-only fields -> the tree to show.
@@ -800,13 +948,24 @@ function IconButton({ icon, title, onClick }) {
 }
 
 const DROPDOWN = { Item: DropdownMenuItem, Separator: DropdownMenuSeparator }
-const CONTEXT = { Item: ContextMenuItem, Separator: ContextMenuSeparator }
+const CONTEXT = { Item: ContextMenuItem, Separator: ContextMenuSeparator, Sub: ContextMenuSub, SubTrigger: ContextMenuSubTrigger, SubContent: ContextMenuSubContent }
 
 // One item list feeds both the ⋯ dropdown and the right-click menu.
 // Item shapes: '-' | { header } | { swatches, value, onChange } | { label, icon, onSelect, … }
 function menuChildren(items, kit) {
-  return items.filter(Boolean).map((it, i) => {
+  return items.filter(Boolean).flatMap((it, i) => {
     if (it === '-') return jsx(kit.Separator, {}, 'sep' + i)
+    // { submenu, icon, items }: a nested menu (right-click); the ⋯ dropdown
+    // has no submenu kit and lists the items under a header instead.
+    if (it.submenu) {
+      if (!kit.Sub) return menuChildren([{ header: it.submenu }, ...it.items], kit)
+      return jsxs(kit.Sub, {
+        children: [
+          jsxs(kit.SubTrigger, { children: [it.icon ? jsx(Codicon, { name: it.icon, size: '0.8125rem' }, 'i') : null, jsx('span', { children: it.submenu }, 'l')] }, 'tr'),
+          jsx(kit.SubContent, { style: { maxHeight: '60vh', overflowY: 'auto' }, onClick: e => e.stopPropagation(), children: menuChildren(it.items, kit) }, 'c')
+        ]
+      }, 'sub' + i)
+    }
     if (it.header)
       return jsx(
         'div',
@@ -1391,7 +1550,7 @@ function NavList() {
   }, 'nav')
 }
 
-function PinnedPane() {
+function PinnedPane({ onSwitch } = {}) {
   const connectionId = useValue(host.state.connectionId)
   const focused = useValue(host.state.focusedStoredSessionId)
   const key = treeKey(connectionId)
@@ -2008,6 +2167,7 @@ function PinnedPane() {
               'label'
             ),
             jsx(IconButton, { icon: viewOpts.pinnedOnly ? 'pinned' : 'pin', title: viewOpts.pinnedOnly ? 'Tout afficher' : 'Seulement les conversations épinglées (sujets en cours)', onClick: () => setView({ pinnedOnly: !viewOpts.pinnedOnly }) }, 'pinonly'),
+            onSwitch ? jsx(IconButton, { icon: 'list-flat', title: 'Vue Sujets', onClick: () => onSwitch('sujets') }, 'sujets') : null,
             jsx(IconButton, { icon: 'new-folder', title: 'New folder', onClick: () => newFolder(ROOT) }, 'new'),
             jsx(RowMenu, { items: filterItems, icon: narrowed ? 'filter-filled' : 'filter', label: narrowed ? 'Filter and order (filtered)' : 'Filter and order' }, 'filter'),
             jsx(RowMenu, { items: layoutItems, icon: 'kebab-vertical', label: 'More' }, 'more')
@@ -2062,6 +2222,388 @@ function PinnedPane() {
   })
 }
 
+// ── Sujets view (v0.7.0) ─────────────────────────────────────────────────────
+// The default view of the tab: every chat in one list sorted by last activity,
+// grouped by date, with company pills, the General buttons and hover actions.
+// The folder view stays one click away (filet de sécurité).
+
+const SUBJECTS_CSS = `
+[data-pf-subjects] .pfs-row{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:9px;align-items:center;padding:5px 8px;border-radius:7px;cursor:pointer;position:relative;user-select:none}
+[data-pf-subjects] .pfs-row:hover{background:var(--ui-row-hover-background, var(--ui-control-hover-background))}
+[data-pf-subjects] .pfs-row.pfs-sel{background:var(--ui-row-active-background)}
+[data-pf-subjects] .pfs-dot{width:8px;height:8px;border-radius:50%}
+[data-pf-subjects] .pfs-tt{display:flex;align-items:baseline;min-width:0;font-size:0.8125rem;line-height:1.35}
+[data-pf-subjects] .pfs-tx{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+[data-pf-subjects] .pfs-sub{font-size:0.6875rem;color:var(--ui-text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3}
+[data-pf-subjects] .pfs-tm{font-size:0.6875rem;color:var(--ui-text-tertiary);white-space:nowrap}
+[data-pf-subjects] .pfs-row.pfs-fresh .pfs-tm{color:var(--ui-text-secondary, inherit)}
+[data-pf-subjects] .pfs-right{position:relative;min-width:44px;display:flex;justify-content:flex-end}
+[data-pf-subjects] .pfs-hv{display:none;gap:2px;position:absolute;right:-2px;top:50%;transform:translateY(-50%)}
+[data-pf-subjects] .pfs-row:hover .pfs-hv{display:flex}
+[data-pf-subjects] .pfs-row:hover .pfs-tm{visibility:hidden}
+[data-pf-subjects] .pfs-ib{width:22px;height:22px;border-radius:5px;display:grid;place-items:center;color:var(--ui-text-tertiary);background:transparent;border:0;cursor:pointer}
+[data-pf-subjects] .pfs-ib:hover{background:var(--ui-control-active-background, var(--ui-control-hover-background));color:var(--foreground, inherit)}
+[data-pf-subjects] .pfs-tri{font-size:0.625rem;color:var(--ui-orange, #D08A34);margin-left:6px;white-space:nowrap;flex-shrink:0}
+[data-pf-subjects] .pfs-grp{display:flex;justify-content:space-between;padding:10px 8px 3px;font-size:0.6875rem;font-weight:600;color:var(--ui-text-quaternary, var(--ui-text-tertiary));letter-spacing:.03em;cursor:pointer;user-select:none;text-transform:uppercase}
+[data-pf-subjects] .pfs-more{padding:3px 8px 3px 25px;font-size:0.71875rem;color:var(--ui-text-tertiary);cursor:pointer}
+[data-pf-subjects] .pfs-more:hover{color:var(--foreground, inherit)}
+[data-pf-subjects] .pfs-gens{display:grid;grid-template-columns:repeat(auto-fill,minmax(38px,1fr));gap:4px}
+[data-pf-subjects] .pfs-gen{height:28px;border-radius:7px;border:1px solid var(--ui-stroke-tertiary);background:var(--ui-bg-card, transparent);display:flex;align-items:center;justify-content:center;font-size:0.6875rem;font-weight:600;cursor:pointer;position:relative}
+[data-pf-subjects] .pfs-gen:hover{background:var(--ui-control-hover-background)}
+[data-pf-subjects] .pfs-gen .pfs-nu{position:absolute;top:3px;right:4px;width:6px;height:6px;border-radius:50%;background:var(--ui-accent, var(--theme-primary))}
+[data-pf-subjects] .pfs-orgs{display:flex;gap:4px;flex-wrap:wrap}
+[data-pf-subjects] .pfs-org{display:flex;align-items:center;gap:5px;padding:2px 8px;border-radius:14px;border:1px solid var(--ui-stroke-tertiary);font-size:0.71875rem;cursor:pointer;user-select:none;color:var(--ui-text-tertiary)}
+[data-pf-subjects] .pfs-org i{width:7px;height:7px;border-radius:50%;display:inline-block}
+[data-pf-subjects] .pfs-org.pfs-on{color:var(--foreground, inherit);background:var(--ui-control-active-background, var(--ui-control-hover-background));border-color:var(--ui-stroke-secondary, var(--ui-stroke-tertiary))}
+[data-pf-subjects] .pfs-org.pfs-off{opacity:.45}
+[data-pf-subjects] .pfs-new{border-radius:7px;padding:0 10px;height:28px;font-weight:600;font-size:0.75rem;white-space:nowrap;cursor:pointer;border:0;background:var(--theme-primary);color:var(--primary-foreground, #fff)}
+[data-pf-subjects] .pfs-new:hover{filter:brightness(1.08)}
+[data-pf-subjects] .pfs-foot{border-top:1px solid var(--ui-stroke-tertiary);padding:6px 12px;font-size:0.71875rem;color:var(--ui-text-tertiary);display:flex;justify-content:space-between;flex-shrink:0}
+[data-pf-subjects] .pfs-closed{border-top:1px solid var(--ui-stroke-tertiary);max-height:40%;overflow:auto;padding:4px 6px;flex-shrink:0}
+[data-pf-subjects] .pfs-crow{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;font-size:0.75rem;color:var(--ui-text-tertiary)}
+[data-pf-subjects] .pfs-crow:hover{background:var(--ui-control-hover-background)}
+[data-pf-subjects] .pfs-reopen{border:1px solid var(--ui-stroke-tertiary);border-radius:6px;padding:1px 8px;font-size:0.6875rem;cursor:pointer;background:transparent;color:inherit}
+[data-pf-subjects] .pfs-reopen:hover{background:var(--ui-control-active-background, var(--ui-control-hover-background));color:var(--foreground, inherit)}
+`
+
+const CLOSED_TITLES_KEY = 'closedTitles'
+
+function SubjectsPane({ onSwitch }) {
+  const connectionId = useValue(host.state.connectionId)
+  const focused = useValue(host.state.focusedStoredSessionId)
+  const key = treeKey(connectionId)
+  const [tree, setTreeRaw] = useState(() => loadTree(key))
+  useEffect(() => {
+    setTreeRaw(loadTree(key))
+    return onBus(ev => ev.type === 'tree' && ev.key === key && setTreeRaw(ev.tree))
+  }, [key])
+  const setTree = fn => mutateTree(key, fn)
+  useServerSync(key)
+  const { rows, error, dropRow, patchRow, refresh: refreshRows } = usePinnedRows(key)
+  useEffect(() => onBus(ev => ev.type === 'rows' && refreshRows()), [key])
+
+  const [query, setQuery] = useState('')
+  const [orgSel, setOrgSel] = useState(() => store.get('subjectsOrgs', []))
+  const [openGroups, setOpenGroups] = useState({})
+  const [showClosed, setShowClosed] = useState(false)
+  const [editing, setEditing] = useState(null)
+  const [closedTitles, setClosedTitles] = useState(() => store.get(CLOSED_TITLES_KEY, {}))
+  const now = Date.now()
+
+  const roots = useMemo(() => tree.folders.filter(f => !f.parent || !tree.folders.some(o => o.id === f.parent)), [tree.folders])
+  const rootIds = useMemo(() => new Set(roots.map(f => f.id)), [roots])
+  // Forget a company filter whose folder no longer exists.
+  const orgs = useMemo(() => new Set(orgSel.filter(id => rootIds.has(id))), [orgSel, rootIds])
+  const setOrgs = next => {
+    setOrgSel(next)
+    store.set('subjectsOrgs', next)
+  }
+
+  const all = useMemo(() => subjectRows(tree, rows), [tree, rows])
+  const counts = useMemo(() => orgCounts(all), [all])
+  const visible = useMemo(() => filterSubjects(all, { orgs, query }), [all, orgs, query])
+  const groups = useMemo(() => groupSubjects(visible, now), [visible, Math.floor(now / 60000)])
+  const rowById = useMemo(() => new Map((rows || []).map(r => [r.id, r])), [rows])
+  const liveIds = useMemo(() => new Set((rows || []).map(r => r.id)), [rows])
+  const closed = closedList(tree, liveIds)
+  const single = orgs.size === 1
+
+  const flat = useMemo(() => {
+    const out = []
+    const kids = new Map()
+    for (const f of tree.folders) {
+      const p = f.parent && tree.folders.some(o => o.id === f.parent) ? f.parent : ROOT
+      if (!kids.has(p)) kids.set(p, [])
+      kids.get(p).push(f)
+    }
+    const walk = (parent, depth) => {
+      for (const f of kids.get(parent) || []) {
+        out.push({ f, depth })
+        walk(f.id, depth + 1)
+      }
+    }
+    walk(ROOT, 0)
+    return out
+  }, [tree.folders])
+
+  const openRow = (row, intent) =>
+    host
+      .openSession(row.id, { profile: row.profile || undefined, ...(intent ? { intent } : {}) })
+      .catch(err => host.notifyError(err, 'Impossible d’ouvrir cette conversation'))
+
+  const renameRow = (row, title) => {
+    const next = String(title || '').trim()
+    if (!next || next === row.title) return
+    patchRow(row.id, { title: next })
+    if (!rest) return host.notifyError(new Error('No backend connection'), 'Impossible de renommer')
+    rest('/title', { method: 'POST', body: { session_id: row.id, title: next, ...(row.profile ? { profile: row.profile } : {}) } }).catch(err => {
+      host.notifyError(err, 'Impossible de renommer')
+      refreshRows()
+    })
+  }
+
+  const setArchived = (id, profile, archived) =>
+    rest('/archive', { method: 'POST', body: { session_id: id, archived, ...(profile ? { profile } : {}) } })
+
+  const archiveRow = row => {
+    if (!rest) return host.notifyError(new Error('No backend connection'), 'Impossible d’archiver')
+    dropRow(row.id)
+    setTree(t => ops.forgetSession(t, row.id))
+    setArchived(row.id, row.profile, true)
+      .then(() => host.notify({ kind: 'success', message: '« ' + (row.title || 'Conversation') + ' » archivée', durationMs: 2500 }))
+      .catch(err => {
+        host.notifyError(err, 'Impossible d’archiver')
+        refreshRows()
+      })
+  }
+
+  // Clore = archive + note the id in `closed` (layout.json), so the footer can
+  // list it and reopen it. The title is cached locally: archived chats are not
+  // in the session list any more.
+  const closeRow = row => {
+    if (!rest) return host.notifyError(new Error('No backend connection'), 'Impossible de clore')
+    const title = row.title || row.preview || 'Sans titre'
+    const nextTitles = { ...store.get(CLOSED_TITLES_KEY, {}), [row.id]: { title, profile: row.profile || null } }
+    store.set(CLOSED_TITLES_KEY, nextTitles)
+    setClosedTitles(nextTitles)
+    dropRow(row.id)
+    setTree(t => ops.closeSession(t, row.id))
+    setArchived(row.id, row.profile, true)
+      .then(() => host.notify({ kind: 'success', message: '« ' + title + ' » clos', durationMs: 2500 }))
+      .catch(err => {
+        host.notifyError(err, 'Impossible de clore')
+        setTree(t => ops.reopenSession(t, row.id))
+        refreshRows()
+      })
+  }
+
+  const reopen = id => {
+    if (!rest) return host.notifyError(new Error('No backend connection'), 'Impossible de rouvrir')
+    const meta = closedTitles[id] || {}
+    setTree(t => ops.reopenSession(t, id))
+    setArchived(id, meta.profile, false)
+      .then(() => {
+        host.notify({ kind: 'success', message: '« ' + (meta.title || 'Conversation') + ' » rouverte', durationMs: 2500 })
+        refreshRows()
+      })
+      .catch(err => {
+        host.notifyError(err, 'Impossible de rouvrir')
+        setTree(t => ops.closeSession(t, id))
+      })
+  }
+
+  const menuFor = s => {
+    const row = s.row
+    const fid = folderOf(tree, new Set(tree.folders.map(f => f.id)), row.id)
+    return [
+      { label: s.pinned ? 'Retirer « en cours »' : 'Marquer en cours', icon: s.pinned ? 'pinned' : 'pin', onSelect: () => setTree(t => ops.togglePin(t, row.id)) },
+      { label: 'Ouvrir dans un onglet', icon: 'split-horizontal', onSelect: () => openRow(row, 'tab') },
+      { label: 'Renommer', icon: 'edit', onSelect: () => setEditing(row.id) },
+      {
+        submenu: 'Ranger dans…',
+        icon: 'folder',
+        items: flat.map(({ f, depth }) => ({
+          label: f.name,
+          icon: depth ? 'folder' : 'folder-library',
+          indent: depth,
+          disabled: f.id === fid,
+          onSelect: () => setTree(t => ops.placeSession(t, row.id, f.id))
+        }))
+      },
+      '-',
+      { label: 'Clore', icon: 'check', onSelect: () => closeRow(row) },
+      { label: 'Archiver', icon: 'archive', destructive: true, onSelect: () => archiveRow(row) }
+    ]
+  }
+
+  const subjectRow = s => {
+    const row = s.row
+    const renaming = editing === row.id
+    const color = orgColor(s.org) || 'var(--ui-text-quaternary, #777)'
+    const sub = s.unsorted ? '' : single ? s.activity || '—' : orgLabel(s.org.name) + (s.activity ? ' · ' + s.activity : '')
+    const el = jsxs('div', {
+      className: 'pfs-row' + (focused === row.id ? ' pfs-sel' : '') + (dateBucket(s.ms, now) === 'today' ? ' pfs-fresh' : ''),
+      'data-subject': row.id,
+      title: subjectTitle(s) + '\nClic : ouvrir · Ctrl+clic ou clic molette : nouvel onglet',
+      onClick: e => {
+        if (renaming) return
+        openRow(row, e.ctrlKey || e.metaKey ? 'tab' : undefined)
+      },
+      onMouseDown: e => { if (e.button === 1) e.preventDefault() },
+      onAuxClick: e => {
+        if (e.button !== 1 || renaming) return
+        e.preventDefault()
+        e.stopPropagation()
+        openRow(row, 'tab')
+      },
+      onDoubleClick: e => {
+        e.stopPropagation()
+        setEditing(row.id)
+      },
+      children: [
+        jsx('span', { className: 'pfs-dot', style: { background: color } }, 'dot'),
+        jsxs('div', {
+          style: { minWidth: 0 },
+          children: [
+            renaming
+              ? jsx(NameInput, { initial: row.title || '', onDone: v => { setEditing(null); if (v != null) renameRow(row, v) } }, 'edit')
+              : jsxs('div', {
+                  className: 'pfs-tt',
+                  children: [
+                    jsx('span', { className: 'pfs-tx', children: (s.pinned ? '📌 ' : '') + subjectTitle(s) }, 'tx'),
+                    s.unsorted ? jsx('span', { className: 'pfs-tri', children: 'à ranger' }, 'tri') : null
+                  ]
+                }, 'tt'),
+            sub ? jsx('div', { className: 'pfs-sub', children: sub }, 'sub') : null
+          ]
+        }, 'txt'),
+        jsxs('div', {
+          className: 'pfs-right',
+          children: [
+            jsx('span', { className: 'pfs-tm', children: timeLabel(s.ms, now) }, 'tm'),
+            jsxs('span', {
+              className: 'pfs-hv',
+              children: [
+                jsx('button', { type: 'button', className: 'pfs-ib', title: 'Clore', 'aria-label': 'Clore', onClick: e => { e.stopPropagation(); closeRow(row) }, children: jsx(Codicon, { name: 'check', size: '0.8125rem' }) }, 'c'),
+                jsx('button', { type: 'button', className: 'pfs-ib', title: 'Archiver', 'aria-label': 'Archiver', onClick: e => { e.stopPropagation(); archiveRow(row) }, children: jsx(Codicon, { name: 'archive', size: '0.8125rem' }) }, 'a')
+              ]
+            }, 'hv')
+          ]
+        }, 'right')
+      ]
+    })
+    return jsx(WithContextMenu, { items: menuFor(s), children: el }, 's:' + row.id)
+  }
+
+  const generalsBar = roots.filter(f => f.generalSession)
+  const gens = generalsBar.length
+    ? jsx('div', {
+        className: 'pfs-gens',
+        children: generalsBar.map(f => {
+          const g = rowById.get(f.generalSession)
+          const fresh = g && dateBucket(recencyMs(g), now) === 'today'
+          return jsxs('div', {
+            className: 'pfs-gen',
+            role: 'button',
+            title: f.name + ' – Général' + (fresh ? ' (active aujourd’hui)' : ''),
+            style: { color: orgColor(f) || undefined },
+            onClick: e =>
+              host
+                .openSession(f.generalSession, { profile: g?.profile || undefined, ...(e.ctrlKey || e.metaKey ? { intent: 'tab' } : {}) })
+                .catch(err => host.notifyError(err, 'Impossible d’ouvrir la conversation générale')),
+            children: [orgShort(f.name), fresh ? jsx('span', { className: 'pfs-nu' }, 'nu') : null]
+          }, f.id)
+        })
+      }, 'gens')
+    : null
+
+  const pills = jsx('div', {
+    className: 'pfs-orgs',
+    children: roots.map(f =>
+      jsxs('span', {
+        className: 'pfs-org' + (orgs.has(f.id) ? ' pfs-on' : orgs.size ? ' pfs-off' : ''),
+        title: 'Clic : seulement ' + f.name + ' · Ctrl+clic : combiner',
+        onClick: e => setOrgs(toggleOrgFilter([...orgs], f.id, e.ctrlKey || e.metaKey)),
+        children: [
+          jsx('i', { style: { background: orgColor(f) || 'var(--ui-text-quaternary)' } }, 'i'),
+          orgLabel(f.name),
+          jsx('span', { style: { color: 'var(--ui-text-quaternary, var(--ui-text-tertiary))' }, children: counts.get(f.id) || 0 }, 'n')
+        ]
+      }, f.id)
+    )
+  }, 'orgs')
+
+  let body
+  if (rows == null && !error) body = [jsx('div', { className: 'pfs-more', children: 'Chargement…' }, 'l')]
+  else if (rows == null) body = [jsx('div', { className: 'pfs-more', children: 'Impossible de charger les conversations : ' + error }, 'e')]
+  else {
+    body = groups.flatMap(g => {
+      const open = !!openGroups[g.key]
+      const { shown, hidden } = shownInGroup(g, open)
+      const toggle = () => setOpenGroups(o => ({ ...o, [g.key]: !o[g.key] }))
+      return [
+        jsxs('div', { className: 'pfs-grp', onClick: toggle, children: [jsx('span', { children: g.label }, 'l'), jsx('span', { children: g.rows.length }, 'n')] }, 'g:' + g.key),
+        ...shown.map(subjectRow),
+        hidden > 0 ? jsx('div', { className: 'pfs-more', onClick: toggle, children: shown.length ? '+ ' + hidden + ' autres' : 'Afficher les ' + hidden }, 'm:' + g.key) : null,
+        open && g.limit !== Infinity && g.rows.length > g.limit ? jsx('div', { className: 'pfs-more', onClick: toggle, children: 'Replier' }, 'r:' + g.key) : null
+      ]
+    })
+    if (!visible.length) body.push(jsx('div', { className: 'pfs-more', children: query.trim() ? 'Rien ne correspond à « ' + query.trim() + ' ».' : 'Aucune conversation.' }, 'none'))
+  }
+
+  const moreItems = [
+    ...NAV.map(n => ({ label: n.label, icon: n.icon, onSelect: () => { try { n.run() } catch (e) { console.error('[pinned-folders] nav', e) } } })),
+    '-',
+    { label: 'Vue Dossiers', icon: 'list-tree', onSelect: () => onSwitch('dossiers') }
+  ]
+
+  return jsxs('div', {
+    'data-pinned-folders': '',
+    'data-pf-subjects': '',
+    style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
+    children: [
+      jsx('style', { children: SUBJECTS_CSS }, 'css'),
+      jsxs('div', {
+        style: { display: 'flex', alignItems: 'center', gap: 2, padding: '8px 6px 2px 10px', flexShrink: 0 },
+        children: [
+          jsx('span', { style: { flex: 1, fontSize: '0.64rem', fontWeight: 600, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--theme-primary)' }, children: 'Sujets' }, 'label'),
+          jsx(IconButton, { icon: 'list-tree', title: 'Revenir à la vue Dossiers', onClick: () => onSwitch('dossiers') }, 'sw'),
+          jsx(RowMenu, { items: moreItems, icon: 'kebab-vertical', label: 'Plus' }, 'more')
+        ]
+      }, 'head'),
+      jsxs('div', {
+        style: { padding: '4px 10px 6px', display: 'flex', flexDirection: 'column', gap: 7, flexShrink: 0 },
+        children: [
+          jsxs('div', {
+            style: { display: 'flex', gap: 6, alignItems: 'center' },
+            children: [
+              jsx('div', { style: { flex: 1, minWidth: 0, display: 'flex' }, children: jsx(SearchField, { placeholder: 'Chercher un sujet', value: query, onChange: setQuery, containerClassName: 'w-full' }) }, 's'),
+              jsx('button', { type: 'button', className: 'pfs-new', onClick: () => host.newChat?.(), children: '+ Nouveau' }, 'n')
+            ]
+          }, 'r1'),
+          gens,
+          pills
+        ]
+      }, 'top'),
+      jsx('div', { style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '0 6px 8px' }, children: body }, 'list'),
+      showClosed
+        ? jsx('div', {
+            className: 'pfs-closed',
+            children: closed.length
+              ? closed.map(id =>
+                  jsxs('div', {
+                    className: 'pfs-crow',
+                    children: [
+                      jsx(Codicon, { name: 'check', size: '0.75rem' }, 'i'),
+                      jsx('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: closedTitles[id]?.title || id }, 't'),
+                      jsx('button', { type: 'button', className: 'pfs-reopen', onClick: () => reopen(id), children: 'Rouvrir' }, 'b')
+                    ]
+                  }, id)
+                )
+              : jsx('div', { className: 'pfs-crow', children: 'Aucun sujet clos.' }, 'none')
+          }, 'closed')
+        : null,
+      jsxs('div', {
+        className: 'pfs-foot',
+        children: [
+          jsx('span', { children: visible.length + ' sujet' + (visible.length > 1 ? 's' : '') + ' ouvert' + (visible.length > 1 ? 's' : '') }, 'n'),
+          jsx('span', { style: { cursor: 'pointer' }, onClick: () => setShowClosed(v => !v), children: 'Clos (' + closed.length + ') ' + (showClosed ? '▾' : '▸') }, 'c')
+        ]
+      }, 'foot')
+    ]
+  })
+}
+
+// The tab: Sujets by default, Dossiers one click away (stored per app).
+function DossiersTab() {
+  const [mode, setModeRaw] = useState(() => (store.get('mode', 'sujets') === 'dossiers' ? 'dossiers' : 'sujets'))
+  const setMode = m => {
+    setModeRaw(m)
+    store.set('mode', m)
+  }
+  return mode === 'dossiers' ? jsx(PinnedPane, { onSwitch: setMode }) : jsx(SubjectsPane, { onSwitch: setMode })
+}
+
 export default {
   id: 'pinned-folders',
   name: 'Pinned folders',
@@ -2082,7 +2624,7 @@ export default {
         tabTitleText: () => 'Dossiers',
         dock: { pane: 'sessions', pos: 'center', enforce: true }
       },
-      render: () => jsx(PinnedPane, {})
+      render: () => jsx(DossiersTab, {})
     })
   }
 }

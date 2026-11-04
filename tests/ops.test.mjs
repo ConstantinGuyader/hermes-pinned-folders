@@ -479,7 +479,8 @@ const legacy = { folders: [{ id: 'w', name: 'Work', parent: null, color: 'hsl(1 
 const loaded = normalize(JSON.parse(JSON.stringify(legacy)))
 assert(JSON.stringify(loaded.view) === JSON.stringify(DEFAULT_VIEW), 'old layout without view state loads with default view')
 assert(loaded.pinned.length === 0, 'old layout loads with no pinned chats')
-assert(JSON.stringify({ ...loaded, view: undefined, pinned: undefined }) === JSON.stringify({ ...legacy, view: undefined }), 'old layout keeps folders, colors, placement, order, collapse unchanged')
+assert(Array.isArray(loaded.closed) && loaded.closed.length === 0, 'old layout loads with no closed chats')
+assert(JSON.stringify({ ...loaded, view: undefined, pinned: undefined, closed: undefined }) === JSON.stringify({ ...legacy, view: undefined }), 'old layout keeps folders, colors, placement, order, collapse unchanged')
 assert(JSON.stringify(normalizeView({ order: 'sideways', status: 42, unreadOnly: 'yes' })) === JSON.stringify(DEFAULT_VIEW), 'garbage view values fall back to defaults')
 // ── normalizeView edges: the persisted-view migration boundary. This function
 // rewrites user view state on every load, so "never break user state" applies to
@@ -704,4 +705,89 @@ if (FULL) {
   const t2 = ops.togglePin(ops.togglePin(t1, 'b'), 'a'); assert(t2.pinned.join() === 'b', 'togglePin unpins and keeps order')
   assert(ops.forgetSession(t1, 'a').pinned.length === 0, 'forgetSession drops the pin')
   assert(mod.sharedPart(t1).pinned.join() === 'a', 'pins are part of the synced layout')
+}
+
+// ── Sujets view (v0.7.0): closed field, ops, date groups, filters ──
+{
+  const { subjectRows, filterSubjects, toggleOrgFilter, orgCounts, groupSubjects, shownInGroup, dateBucket, timeLabel, closedList, isSubjectRow, orgColor, orgShort, orgLabel } = mod
+  // normalize: closed is kept, deduped, junk dropped
+  const n = normalize({ folders: [], placed: {}, order: [], closed: ['a', 'a', 3, '', null, 'b'], foldersOrdered: true })
+  assert(n.closed.join() === 'a,b', 'normalize keeps closed ids, dedupes and drops junk')
+  assert(normalize({ folders: [], closed: 'x' }).closed.length === 0, 'normalize: a non-array closed becomes []')
+  // ops
+  const c0 = normalize({ folders: [{ id: 'f', name: 'F', parent: null }], placed: { a: 'f' }, order: ['a'], pinned: ['a'], foldersOrdered: true })
+  const c1 = ops.closeSession(c0, 'a')
+  assert(c1.closed.join() === 'a' && c1.placed.a === 'f' && c1.pinned.join() === 'a', 'closeSession notes the id and keeps folder + pin')
+  assert(ops.closeSession(ops.closeSession(c1, 'b'), 'a').closed.join() === 'b,a', 'closeSession twice moves the id last, no duplicate')
+  assert(ops.reopenSession(c1, 'a').closed.length === 0, 'reopenSession drops the id')
+  assert(ops.reopenSession(c1, 'zz') === c1, 'reopenSession of an unknown id is a no-op')
+  assert(ops.forgetSession(c1, 'a').closed.length === 0, 'forgetSession (delete/archive) also drops closed')
+  assert(ops.closeSession(c0, '') === c0, 'closeSession ignores an empty id')
+  // sharedPart
+  assert(mod.sharedPart(c1).closed.join() === 'a', 'closed is part of the synced layout')
+  assert(Array.isArray(mod.sharedPart({ folders: [], placed: {}, order: [] }).closed), 'sharedPart defaults closed to []')
+  assert(mod.adoptServer(normalize({}), { folders: [], placed: {}, order: [], closed: ['q'] }).closed.join() === 'q', 'adoptServer takes closed from the server')
+  // closedList: still-archived ones only, newest closed first
+  assert(closedList({ closed: ['a', 'b', 'c'] }, new Set(['b'])).join() === 'c,a', 'closedList hides chats back in the list, newest first')
+
+  // subjectRows: company/activity, generals, archived, sub-sessions, cron out
+  const T = normalize({ folders: [
+    { id: 'ap', name: 'Apoleos', parent: null, generalSession: 'gen' },
+    { id: 'dir', name: 'Direction', parent: 'ap' },
+    { id: 'pe', name: 'Perso', parent: null, color: '#123456' },
+    { id: 'gu', name: 'GUYADER SI Consulting', parent: null }
+  ], placed: { s1: 'dir', s2: 'ap', s3: 'pe', gen: 'ap' }, order: [], pinned: ['s3'], foldersOrdered: true })
+  const H = 3600 * 1000
+  const now = new Date(2026, 10, 4, 15, 0, 0).getTime()
+  const sec = ms => ms / 1000
+  const R = [
+    { id: 's1', title: 'Pacte', last_active: sec(now - H) },
+    { id: 's2', title: 'Numeum', last_active: sec(now - 30 * H) },
+    { id: 's3', title: 'Sinistre auto', last_active: sec(now - 4 * 24 * H) },
+    { id: 's4', title: 'Loose chat', last_active: sec(now - 2 * H) },
+    { id: 'gen', title: 'Apoleos – Général', last_active: sec(now) },
+    { id: 'arch', title: 'x', archived: true, last_active: sec(now) },
+    { id: 'kid', title: 'x', parent_session_id: 's1', last_active: sec(now) },
+    { id: 'cr', title: 'x', source: 'cron', last_active: sec(now) }
+  ]
+  assert(isSubjectRow(R[0]) && !isSubjectRow(R[5]) && !isSubjectRow(R[6]) && !isSubjectRow(R[7]), 'isSubjectRow: archived, sub-sessions and cron are out')
+  const L = subjectRows(T, R)
+  assert(L.map(s => s.id).join() === 's1,s4,s2,s3', 'subjectRows: newest first, general/archived/sub/cron left out: ' + L.map(s => s.id).join())
+  const s1 = L.find(s => s.id === 's1'), s2 = L.find(s => s.id === 's2'), s4 = L.find(s => s.id === 's4'), s3 = L.find(s => s.id === 's3')
+  assert(s1.orgId === 'ap' && s1.activity === 'Direction', 'company = root folder, activity = sub-folder')
+  assert(s2.orgId === 'ap' && s2.activity === '', 'chat filed at the root: company only, no activity')
+  assert(s4.unsorted && s4.orgId === null, 'chat with no folder is « à ranger »')
+  assert(s3.pinned && !s1.pinned, 'pinned flag read from layout pinned')
+  // colors and labels
+  assert(orgColor(T.folders[2]) === '#123456' && orgColor(T.folders[0]) === '#6E78E6' && orgColor(null) === null, 'orgColor: folder color first, v6 palette otherwise')
+  assert(orgShort('GEEIS+') === 'G+' && orgShort('Apoleos') === 'AP' && orgShort('GUYADER SI Consulting') === 'GU', 'orgShort: two-letter tags')
+  assert(orgLabel('GUYADER SI Consulting') === 'GUYADER SI' && orgLabel('Perso') === 'Perso', 'orgLabel shortens long names')
+  // filters
+  assert(filterSubjects(L, { orgs: ['ap'] }).map(s => s.id).join() === 's1,s2', 'company filter keeps only that company')
+  assert(filterSubjects(L, { orgs: new Set(['ap', 'pe']) }).length === 3, 'two companies combine')
+  assert(filterSubjects(L, { query: 'direc' }).map(s => s.id).join() === 's1', 'text filter matches the activity')
+  assert(filterSubjects(L, { query: 'SINISTRE' }).map(s => s.id).join() === 's3', 'text filter matches the title, any case')
+  assert(filterSubjects(L, { orgs: ['ap'], query: 'numeum' }).map(s => s.id).join() === 's2', 'company and text filters combine')
+  assert(filterSubjects(L, {}).length === 4, 'no filter shows everything')
+  assert(toggleOrgFilter([], 'a', false).join() === 'a', 'pill click: only this company')
+  assert(toggleOrgFilter(['a'], 'a', false).length === 0, 'pill click on the only active pill clears the filter')
+  assert(toggleOrgFilter(['a', 'b'], 'a', false).join() === 'a', 'plain click with several active keeps only that one')
+  assert(toggleOrgFilter(['a'], 'b', true).join() === 'a,b' && toggleOrgFilter(['a', 'b'], 'a', true).join() === 'b', 'ctrl+click adds / removes')
+  const cnt = orgCounts(L)
+  assert(cnt.get('ap') === 2 && cnt.get('pe') === 1 && !cnt.get('gu'), 'orgCounts per company')
+  // date groups
+  const D = 24 * H
+  assert(dateBucket(now - H, now) === 'today' && dateBucket(now - 16 * H, now) === 'yesterday', 'dateBucket today / yesterday (calendar days)')
+  assert(dateBucket(now - 3 * D, now) === 'week' && dateBucket(now - 10 * D, now) === 'month' && dateBucket(now - 40 * D, now) === 'older', 'dateBucket week / month / older')
+  assert(timeLabel(now - 16 * H, now) === 'hier' && /\d{2}:\d{2}/.test(timeLabel(now - H, now)), 'timeLabel: hour today, « hier »')
+  const many = Array.from({ length: 8 }, (_, i) => ({ id: 'm' + i, ms: now - (10 + i) * D }))
+  const old = [{ id: 'o1', ms: now - 60 * D }, { id: 'o2', ms: now - 90 * D }]
+  const G = groupSubjects([{ id: 't', ms: now - H }, ...many, ...old], now)
+  assert(G.map(g => g.key).join() === 'today,month,older', 'groupSubjects keeps non-empty groups in order')
+  const month = G.find(g => g.key === 'month')
+  assert(shownInGroup(month, false).shown.length === 5 && shownInGroup(month, false).hidden === 3, 'Ce mois-ci shows 5 then « + 3 autres »')
+  assert(shownInGroup(month, true).hidden === 0, 'Ce mois-ci unfolded shows all')
+  const older = G.find(g => g.key === 'older')
+  assert(shownInGroup(older, false).shown.length === 0 && shownInGroup(older, false).hidden === 2, 'Plus ancien starts folded')
+  assert(shownInGroup(G[0], false).hidden === 0, 'Aujourd’hui is never cut')
 }
